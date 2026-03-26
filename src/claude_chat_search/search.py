@@ -1,4 +1,10 @@
-from .db import file_search as db_file_search, fts_search, get_chunks_by_ids, text_search
+from .db import (
+    file_search as db_file_search,
+    fts_search,
+    get_chunks_by_ids,
+    get_project_paths_for_remote,
+    text_search,
+)
 from .embedder import embed_query
 from .vector_search import numpy_vector_search
 
@@ -20,6 +26,28 @@ def reciprocal_rank_fusion(ranked_lists: list[list[dict]], k: int = RRF_K) -> li
     return sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
 
+def _expand_project_via_remote(conn, project: str) -> list[str] | None:
+    """If a project filter matches sessions with a git_remote, expand to all paths sharing that remote.
+
+    Returns a list of project_path substrings to search, or None if no expansion needed.
+    """
+    # Find git_remote(s) for sessions matching this project substring
+    rows = list(conn.execute(
+        "SELECT DISTINCT git_remote FROM sessions WHERE project_path LIKE '%' || ? || '%' AND git_remote IS NOT NULL",
+        (project,),
+    ))
+    if not rows:
+        return None
+
+    # Collect all project paths sharing any of these remotes
+    all_paths = set()
+    for (remote,) in rows:
+        for path in get_project_paths_for_remote(conn, remote):
+            all_paths.add(path)
+
+    return list(all_paths) if len(all_paths) > 1 else None
+
+
 def _build_session_filter(
     conn,
     project: str | None = None,
@@ -27,7 +55,11 @@ def _build_session_filter(
     since: str | None = None,
     before: str | None = None,
 ) -> set[str] | None:
-    """Pre-filter session IDs by metadata. Returns None if no filters active."""
+    """Pre-filter session IDs by metadata. Returns None if no filters active.
+
+    The project filter auto-expands across multiple checkouts of the same repo
+    by looking up the git_remote column.
+    """
     if not any([project, branch, since, before]):
         return None
 
@@ -35,8 +67,15 @@ def _build_session_filter(
     params: list[str] = []
 
     if project:
-        conditions.append("project_path LIKE '%' || ? || '%'")
-        params.append(project)
+        # Try to expand to all checkouts sharing the same git remote
+        expanded_paths = _expand_project_via_remote(conn, project)
+        if expanded_paths:
+            placeholders = " OR ".join("project_path = ?" for _ in expanded_paths)
+            conditions.append(f"({placeholders})")
+            params.extend(expanded_paths)
+        else:
+            conditions.append("project_path LIKE '%' || ? || '%'")
+            params.append(project)
     if branch:
         conditions.append("git_branch LIKE '%' || ? || '%'")
         params.append(branch)

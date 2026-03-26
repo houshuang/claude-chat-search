@@ -64,11 +64,29 @@ def init_db(conn: apsw.Connection) -> None:
         ("commands_run", "TEXT"),
         ("parent_session_id", "TEXT"),
         ("topic_summary", "TEXT"),
+        ("git_remote", "TEXT"),
     ]:
         try:
             conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} {col_type}")
         except apsw.SQLError:
             pass  # column already exists
+
+    # Subagent metadata table (lightweight — no chunks, no embeddings)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS subagents (
+            agent_id TEXT PRIMARY KEY,
+            parent_session_id TEXT REFERENCES sessions(session_id),
+            agent_type TEXT,
+            description TEXT,
+            message_count INTEGER,
+            file_size INTEGER,
+            first_prompt TEXT,
+            first_message_at TEXT,
+            last_message_at TEXT,
+            jsonl_path TEXT,
+            indexed_at TEXT
+        )
+    """)
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS chunks (
@@ -360,6 +378,94 @@ def get_topic_summary(conn: apsw.Connection, session_id: str) -> str | None:
         (session_id,),
     ).fetchone()
     return row[0] if row else None
+
+
+def insert_subagent(conn: apsw.Connection, data: dict) -> None:
+    conn.execute(
+        """INSERT INTO subagents
+           (agent_id, parent_session_id, agent_type, description,
+            message_count, file_size, first_prompt,
+            first_message_at, last_message_at, jsonl_path, indexed_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(agent_id) DO UPDATE SET
+            parent_session_id=excluded.parent_session_id,
+            agent_type=excluded.agent_type,
+            description=excluded.description,
+            message_count=excluded.message_count,
+            file_size=excluded.file_size,
+            first_prompt=excluded.first_prompt,
+            first_message_at=excluded.first_message_at,
+            last_message_at=excluded.last_message_at,
+            jsonl_path=excluded.jsonl_path,
+            indexed_at=excluded.indexed_at""",
+        (
+            data["agent_id"],
+            data["parent_session_id"],
+            data.get("agent_type"),
+            data.get("description"),
+            data.get("message_count", 0),
+            data.get("file_size", 0),
+            data.get("first_prompt"),
+            data.get("first_message_at"),
+            data.get("last_message_at"),
+            data.get("jsonl_path"),
+            data.get("indexed_at"),
+        ),
+    )
+
+
+def get_subagents_for_session(conn: apsw.Connection, parent_session_id: str) -> list[dict]:
+    return _fetchall(
+        conn,
+        """SELECT * FROM subagents
+           WHERE parent_session_id = ?
+           ORDER BY first_message_at""",
+        (parent_session_id,),
+    )
+
+
+def get_subagent(conn: apsw.Connection, agent_id_prefix: str, parent_session_id: str) -> dict | None:
+    return _fetchone(
+        conn,
+        """SELECT * FROM subagents
+           WHERE agent_id LIKE ? AND parent_session_id = ?""",
+        (f"{agent_id_prefix}%", parent_session_id),
+    )
+
+
+def get_subagent_count(conn: apsw.Connection, parent_session_id: str) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) FROM subagents WHERE parent_session_id = ?",
+        (parent_session_id,),
+    ).fetchone()
+    return row[0] if row else 0
+
+
+def get_git_remote_for_project(conn: apsw.Connection, project_path: str) -> str | None:
+    """Get git_remote for a project path (from any session using that path)."""
+    row = conn.execute(
+        "SELECT git_remote FROM sessions WHERE project_path = ? AND git_remote IS NOT NULL LIMIT 1",
+        (project_path,),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def get_project_paths_for_remote(conn: apsw.Connection, git_remote: str) -> list[str]:
+    """Get all project paths sharing a git remote."""
+    rows = list(conn.execute(
+        "SELECT DISTINCT project_path FROM sessions WHERE git_remote = ?",
+        (git_remote,),
+    ))
+    return [r[0] for r in rows]
+
+
+def update_session_git_remote(conn: apsw.Connection, project_path: str, git_remote: str) -> int:
+    """Set git_remote for all sessions with a given project_path. Returns rows updated."""
+    conn.execute(
+        "UPDATE sessions SET git_remote = ? WHERE project_path = ? AND (git_remote IS NULL OR git_remote != ?)",
+        (git_remote, project_path, git_remote),
+    )
+    return conn.changes()
 
 
 def migrate_vec_table(conn: apsw.Connection) -> int:

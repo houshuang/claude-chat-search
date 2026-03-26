@@ -42,7 +42,7 @@ claude-chat-search search "important query" --rerank
 
 Options:
 - `-n` / `--limit` — number of results (default 10)
-- `-p` / `--project` — filter by project path substring
+- `-p` / `--project` — filter by project path substring (auto-expands across multiple checkouts of the same repo via git remote detection)
 - `-b` / `--branch` — filter by git branch name substring
 - `--since` — only results after date (`YYYY-MM-DD`, `3d`, `2w`, `1m`)
 - `--before` — only results before date
@@ -54,9 +54,23 @@ Options:
 
 ```bash
 claude-chat-search show <session-id> --turn 5
+claude-chat-search show <session-id> --with-subagents
 ```
 
-Partial session ID matching is supported. Use `--turn` to highlight a specific turn.
+Partial session ID matching is supported. Use `--turn` to highlight a specific turn. The header shows subagent count when > 0. Use `--with-subagents` to append subagent summaries.
+
+### Explore subagent conversations
+
+Background agents (subagents) run during a session to handle parallel tasks. Their conversations are indexed as lightweight metadata and accessible on demand:
+
+```bash
+# List all subagents for a session
+claude-chat-search subagents <session-id>
+
+# Show a specific subagent conversation (partial ID matching)
+claude-chat-search subagent <session-id> <agent-id>
+claude-chat-search subagent <session-id> <agent-id> --raw  # untruncated
+```
 
 ## Continuous indexing with daemon
 
@@ -131,4 +145,4 @@ Then Claude Code will search your past conversations when you ask things like "r
 - **db.py** — SQLite with FTS5 for keyword search and `sqlite-vec` for vector storage
 - **search.py** — hybrid search (vector + keyword + grep + file) combined via Reciprocal Rank Fusion, deduplicated by session, with optional cross-encoder reranking via limbic
 - **daemon.py** — persistent indexer daemon: queue-based incremental indexing, message-count skip, startup full scan
-- **cli.py** — Click CLI exposing `init`, `index`, `search`, `show`, `recover`, `reembed`, `summarize`, `cross`, and `daemon` commands
+- **cli.py** — Click CLI exposing `init`, `index`, `search`, `show`, `subagents`, `subagent`, `recover`, `reembed`, `summarize`, `cross`, and `daemon` commands

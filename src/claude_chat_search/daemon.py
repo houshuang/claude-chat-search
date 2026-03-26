@@ -15,12 +15,18 @@ from .db import (
     init_db,
     insert_chunks,
     insert_session,
+    insert_subagent,
+    update_session_git_remote,
 )
 from .parser import (
+    detect_git_remote,
     extract_session_metadata,
     file_info_from_path,
+    find_project_dir,
     iter_jsonl_files,
+    iter_subagent_files,
     parse_jsonl_file,
+    parse_subagent_metadata,
 )
 
 QUEUE_PATH = DB_DIR / ".queue"
@@ -92,6 +98,29 @@ def index_single_session(conn, file_info: dict) -> bool:
     chunks = create_chunks(session_data)
     if chunks:
         insert_chunks(conn, chunks)
+
+    # Backfill git remote for this session's project
+    project_path = file_info["project_path"]
+    remote = detect_git_remote(project_path)
+    if remote:
+        update_session_git_remote(conn, project_path, remote)
+
+    # Index subagent metadata for this session
+    project_dir = find_project_dir(project_path)
+    if project_dir:
+        for sf in iter_subagent_files(sid, project_dir):
+            try:
+                meta = parse_subagent_metadata(sf["jsonl_path"], sf.get("meta_path"))
+                insert_subagent(conn, {
+                    "agent_id": sf["agent_id"],
+                    "parent_session_id": sid,
+                    "file_size": sf["file_size"],
+                    "jsonl_path": sf["jsonl_path"],
+                    "indexed_at": now,
+                    **meta,
+                })
+            except Exception as e:
+                logger.warning(f"Error indexing subagent {sf['agent_id']}: {e}")
 
     _file_fingerprints[sid] = current_fp
     return True

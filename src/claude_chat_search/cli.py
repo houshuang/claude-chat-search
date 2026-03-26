@@ -15,12 +15,26 @@ from .db import (
     get_session,
     get_session_chunks,
     get_stats,
+    get_subagent,
+    get_subagent_count,
+    get_subagents_for_session,
     get_topic_summary,
     init_db,
     insert_chunks,
     insert_session,
+    insert_subagent,
+    update_session_git_remote,
 )
-from .parser import extract_session_metadata, iter_jsonl_files, parse_jsonl_file
+from .parser import (
+    detect_git_remote,
+    extract_session_metadata,
+    find_project_dir,
+    iter_jsonl_files,
+    iter_subagent_files,
+    parse_jsonl_file,
+    parse_subagent_conversation,
+    parse_subagent_metadata,
+)
 
 
 @click.group()
@@ -232,31 +246,16 @@ def search(query, limit, project, branch, since, before, grep_mode, file_mode, d
 @click.argument("session_id")
 @click.option("--turn", "-t", default=None, type=int, help="Highlight a specific turn number")
 @click.option("--context", "-C", default=None, type=int, help="Show N turns around --turn (requires --turn)")
-def show(session_id, turn, context):
+@click.option("--with-subagents", is_flag=True, help="Include subagent summaries")
+def show(session_id, turn, context, with_subagents):
     """Show details of a specific session."""
     conn = get_connection()
     init_db(conn)
 
-    # Support partial session ID matching
-    session = get_session(conn, session_id)
+    session = _resolve_session(conn, session_id)
     if session is None:
-        rows = _fetchall(
-            conn,
-            "SELECT * FROM sessions WHERE session_id LIKE ?",
-            (f"{session_id}%",),
-        )
-        if len(rows) == 1:
-            session = rows[0]
-        elif len(rows) > 1:
-            click.echo(f"Multiple sessions match '{session_id}':")
-            for r in rows:
-                click.echo(f"  {r['session_id']}  {r['project_path']}")
-            conn.close()
-            return
-        else:
-            click.echo(f"Session '{session_id}' not found.")
-            conn.close()
-            return
+        conn.close()
+        return
 
     click.echo(f"Session: {session['session_id']}")
     click.echo(f"Project: {session['project_path']}")
@@ -265,6 +264,9 @@ def show(session_id, turn, context):
     if session["git_branch"]:
         click.echo(f"Branch: {session['git_branch']}")
     click.echo(f"Messages: {session['message_count']}")
+    subagent_count = get_subagent_count(conn, session["session_id"])
+    if subagent_count > 0:
+        click.echo(f"Subagents: {subagent_count}")
     duration = _format_duration(session['first_message_at'], session['last_message_at'])
     time_str = f"{_format_time(session['first_message_at'])} → {_format_time(session['last_message_at'])}"
     if duration:
@@ -296,7 +298,176 @@ def show(session_id, turn, context):
         click.echo(f"{prefix}   Assistant: {_truncate(chunk['assistant_content'], max_asst)}")
         click.echo()
 
+    if with_subagents and subagent_count > 0:
+        subs = get_subagents_for_session(conn, session["session_id"])
+        click.echo(f"\n--- Subagents ({len(subs)}) ---\n")
+        for i, sub in enumerate(subs, 1):
+            agent_type = sub["agent_type"] or "unknown"
+            desc = sub["description"] or ""
+            prompt_preview = _truncate(sub["first_prompt"] or "", 150)
+            label = f"[{i}] agent-{sub['agent_id'][:8]} ({agent_type})"
+            if desc:
+                label += f" — {desc}"
+            click.echo(label)
+            if prompt_preview:
+                click.echo(f"    Prompt: {prompt_preview}")
+            click.echo(f"    {sub['message_count']} messages, {_format_size(sub['file_size'])}")
+            click.echo()
+
     conn.close()
+
+
+@cli.command()
+@click.argument("session_id")
+def subagents(session_id):
+    """List all subagent conversations for a session."""
+    conn = get_connection()
+    init_db(conn)
+
+    session = _resolve_session(conn, session_id)
+    if session is None:
+        conn.close()
+        return
+
+    subs = get_subagents_for_session(conn, session["session_id"])
+
+    # Fall back to filesystem scan if DB has no records
+    if not subs:
+        project_dir = find_project_dir(session["project_path"])
+        if project_dir:
+            now = datetime.now(timezone.utc).isoformat()
+            for sf in iter_subagent_files(session["session_id"], project_dir):
+                meta = parse_subagent_metadata(sf["jsonl_path"], sf.get("meta_path"))
+                sub_data = {
+                    "agent_id": sf["agent_id"],
+                    "parent_session_id": session["session_id"],
+                    "file_size": sf["file_size"],
+                    "jsonl_path": sf["jsonl_path"],
+                    "indexed_at": now,
+                    **meta,
+                }
+                insert_subagent(conn, sub_data)
+                subs.append(sub_data)
+
+    click.echo(f"Session: {session['session_id']}")
+    if session["slug"]:
+        click.echo(f"Slug: {session['slug']}")
+    click.echo(f"Subagents: {len(subs)}")
+
+    if not subs:
+        click.echo("\nNo subagents found for this session.")
+        conn.close()
+        return
+
+    click.echo(f"\n{'#':>3}  {'Agent ID':<12} {'Type':<20} {'Msgs':>5}  {'Size':>7}  First prompt")
+    click.echo("-" * 90)
+    for i, sub in enumerate(subs, 1):
+        agent_id_short = sub["agent_id"][:8]
+        agent_type = (sub.get("agent_type") or "unknown")[:20]
+        msgs = sub.get("message_count", 0)
+        size = _format_size(sub.get("file_size", 0))
+        prompt = _truncate(sub.get("first_prompt") or "", 60)
+        click.echo(f"{i:>3}  {agent_id_short:<12} {agent_type:<20} {msgs:>5}  {size:>7}  {prompt}")
+
+    conn.close()
+
+
+@cli.command()
+@click.argument("session_id")
+@click.argument("agent_id")
+@click.option("--raw", is_flag=True, help="Show full text without truncation")
+def subagent(session_id, agent_id, raw):
+    """Show the full conversation of a specific subagent."""
+    conn = get_connection()
+    init_db(conn)
+
+    session = _resolve_session(conn, session_id)
+    if session is None:
+        conn.close()
+        return
+
+    # Find subagent by partial ID match
+    sub = get_subagent(conn, agent_id, session["session_id"])
+
+    # Fall back to filesystem if not in DB
+    jsonl_path = None
+    resolved_agent_id = None
+    if sub:
+        jsonl_path = sub["jsonl_path"]
+        resolved_agent_id = sub["agent_id"]
+    else:
+        project_dir = find_project_dir(session["project_path"])
+        if project_dir:
+            for sf in iter_subagent_files(session["session_id"], project_dir):
+                if sf["agent_id"].startswith(agent_id):
+                    jsonl_path = sf["jsonl_path"]
+                    resolved_agent_id = sf["agent_id"]
+                    break
+
+    if not jsonl_path:
+        click.echo(f"Subagent matching '{agent_id}' not found in session {session['session_id'][:12]}.")
+        conn.close()
+        return
+
+    # Parse and display the conversation
+    agent_type = sub["agent_type"] if sub else "unknown"
+    turns = parse_subagent_conversation(jsonl_path)
+
+    click.echo(f"Subagent: {resolved_agent_id} ({agent_type})")
+    click.echo(f"Parent: {session['session_id'][:12]}... ({session.get('slug', '')})")
+    click.echo(f"Turns: {len(turns)}")
+    click.echo()
+
+    max_user = 0 if raw else 500
+    max_asst = 0 if raw else 800
+
+    for t in turns:
+        click.echo(f"    [Turn {t['turn_number']}]  {t.get('timestamp', '')}")
+        user = t["user_content"]
+        asst = t["assistant_content"]
+        if max_user:
+            user = _truncate(user, max_user)
+        if max_asst:
+            asst = _truncate(asst, max_asst)
+        if user:
+            click.echo(f"      User: {user}")
+        if asst:
+            click.echo(f"      Assistant: {asst}")
+        if t.get("tools"):
+            click.echo(f"      {t['tools']}")
+        click.echo()
+
+    conn.close()
+
+
+def _resolve_session(conn, session_id: str) -> dict | None:
+    """Resolve a session by exact or partial ID match. Prints errors on failure."""
+    session = get_session(conn, session_id)
+    if session is None:
+        rows = _fetchall(
+            conn,
+            "SELECT * FROM sessions WHERE session_id LIKE ?",
+            (f"{session_id}%",),
+        )
+        if len(rows) == 1:
+            session = rows[0]
+        elif len(rows) > 1:
+            click.echo(f"Multiple sessions match '{session_id}':")
+            for r in rows:
+                click.echo(f"  {r['session_id']}  {r['project_path']}")
+            return None
+        else:
+            click.echo(f"Session '{session_id}' not found.")
+            return None
+    return session
+
+
+def _format_size(size_bytes: int) -> str:
+    if size_bytes < 1024:
+        return f"{size_bytes}B"
+    if size_bytes < 1024 * 1024:
+        return f"{size_bytes // 1024}KB"
+    return f"{size_bytes // (1024 * 1024)}MB"
 
 
 @cli.command()
@@ -596,6 +767,50 @@ def _run_index(conn, force: bool = False) -> int:
             new_count += 1
 
     click.echo(f"Indexed {new_count} sessions ({skip_count} skipped)", err=True)
+
+    # Backfill git remotes for sessions missing them
+    remote_rows = list(conn.execute(
+        "SELECT DISTINCT project_path FROM sessions WHERE git_remote IS NULL"
+    ))
+    if remote_rows:
+        remote_count = 0
+        for (project_path,) in remote_rows:
+            remote = detect_git_remote(project_path)
+            if remote:
+                updated = update_session_git_remote(conn, project_path, remote)
+                remote_count += updated
+        if remote_count:
+            click.echo(f"Backfilled git remote for {remote_count} sessions", err=True)
+
+    # Index subagent metadata
+    sub_count = 0
+    now = datetime.now(timezone.utc).isoformat()
+    all_sessions = list(conn.execute("SELECT session_id, project_path FROM sessions"))
+    for (sid, proj_path) in all_sessions:
+        project_dir = find_project_dir(proj_path)
+        if not project_dir:
+            continue
+        for sf in iter_subagent_files(sid, project_dir):
+            # Check if already indexed with same mtime
+            existing = conn.execute(
+                "SELECT indexed_at FROM subagents WHERE agent_id = ?",
+                (sf["agent_id"],),
+            ).fetchone()
+            if existing and not force:
+                continue
+            meta = parse_subagent_metadata(sf["jsonl_path"], sf.get("meta_path"))
+            insert_subagent(conn, {
+                "agent_id": sf["agent_id"],
+                "parent_session_id": sid,
+                "file_size": sf["file_size"],
+                "jsonl_path": sf["jsonl_path"],
+                "indexed_at": now,
+                **meta,
+            })
+            sub_count += 1
+    if sub_count:
+        click.echo(f"Indexed {sub_count} subagent metadata records", err=True)
+
     return new_count
 
 

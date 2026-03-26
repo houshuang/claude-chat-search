@@ -1,9 +1,14 @@
 import json
 import os
+import re
+import subprocess
 from pathlib import Path
 
 
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
+GIT_REMOTE_CACHE_PATH = Path.home() / ".claude-chat-search" / "git-remotes.json"
+
+_git_remote_cache: dict[str, str | None] | None = None
 
 
 def decode_project_path(dirname: str) -> str:
@@ -256,6 +261,230 @@ def file_info_from_path(transcript_path: str | Path) -> dict | None:
         result["parent_session_id"] = parts[1]
 
     return result
+
+
+def _normalize_git_remote(url: str) -> str | None:
+    """Extract normalized owner/repo from a git remote URL.
+
+    Handles HTTPS (https://github.com/owner/repo.git) and
+    SSH (git@github.com:owner/repo.git) formats.
+    """
+    url = url.strip()
+    # SSH format: git@github.com:owner/repo.git
+    m = re.match(r"git@[^:]+:(.+?)(?:\.git)?$", url)
+    if m:
+        return m.group(1).lower()
+    # HTTPS format: https://github.com/owner/repo.git
+    m = re.match(r"https?://[^/]+/(.+?)(?:\.git)?$", url)
+    if m:
+        return m.group(1).lower()
+    return None
+
+
+def _load_git_remote_cache() -> dict[str, str | None]:
+    global _git_remote_cache
+    if _git_remote_cache is not None:
+        return _git_remote_cache
+    try:
+        with open(GIT_REMOTE_CACHE_PATH) as f:
+            _git_remote_cache = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        _git_remote_cache = {}
+    return _git_remote_cache
+
+
+def _save_git_remote_cache() -> None:
+    if _git_remote_cache is None:
+        return
+    GIT_REMOTE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(GIT_REMOTE_CACHE_PATH, "w") as f:
+        json.dump(_git_remote_cache, f, indent=2)
+
+
+def detect_git_remote(project_path: str) -> str | None:
+    """Detect the normalized git remote (owner/repo) for a project path.
+
+    Results are cached permanently in ~/.claude-chat-search/git-remotes.json
+    since git remotes don't change for a given directory.
+    """
+    cache = _load_git_remote_cache()
+    if project_path in cache:
+        return cache[project_path]
+
+    remote = None
+    try:
+        result = subprocess.run(
+            ["git", "-C", project_path, "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            remote = _normalize_git_remote(result.stdout.strip())
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+
+    cache[project_path] = remote
+    _save_git_remote_cache()
+    return remote
+
+
+def find_project_dir(project_path: str) -> Path | None:
+    """Find the encoded project directory for a given project_path.
+
+    Iterates ~/.claude/projects/ and decodes each directory name to match.
+    """
+    if not PROJECTS_DIR.exists():
+        return None
+    for d in PROJECTS_DIR.iterdir():
+        if d.is_dir() and decode_project_path(d.name) == project_path:
+            return d
+    return None
+
+
+def iter_subagent_files(parent_session_id: str, project_dir: Path) -> list[dict]:
+    """List all subagent JSONL files for a given parent session."""
+    subagent_dir = project_dir / parent_session_id / "subagents"
+    if not subagent_dir.exists():
+        return []
+
+    results = []
+    for jsonl_file in sorted(subagent_dir.glob("agent-*.jsonl")):
+        # Strip "agent-" prefix and ".jsonl" suffix to get agent_id
+        agent_id = jsonl_file.stem[6:]  # len("agent-") == 6
+        meta_path = jsonl_file.with_name(f"agent-{agent_id}.meta.json")
+        results.append({
+            "agent_id": agent_id,
+            "parent_session_id": parent_session_id,
+            "jsonl_path": str(jsonl_file),
+            "meta_path": str(meta_path) if meta_path.exists() else None,
+            "mtime": os.path.getmtime(jsonl_file),
+            "file_size": os.path.getsize(jsonl_file),
+        })
+    return results
+
+
+def parse_subagent_metadata(jsonl_path: str, meta_path: str | None) -> dict:
+    """Parse lightweight metadata from a subagent without reading the full file.
+
+    Reads meta.json for agent type/description, and streams the JSONL to get
+    message count, first user prompt, and timestamps.
+    """
+    agent_type = None
+    description = None
+
+    if meta_path:
+        try:
+            with open(meta_path) as f:
+                meta = json.load(f)
+                agent_type = meta.get("agentType")
+                description = meta.get("description")
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    message_count = 0
+    first_prompt = None
+    first_ts = None
+    last_ts = None
+
+    try:
+        with open(jsonl_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                msg_type = obj.get("type")
+                if msg_type not in ("user", "assistant"):
+                    continue
+
+                message_count += 1
+                ts = obj.get("timestamp")
+                if ts:
+                    if first_ts is None:
+                        first_ts = ts
+                    last_ts = ts
+
+                if first_prompt is None and msg_type == "user":
+                    first_prompt = extract_text_content(obj)[:500]
+    except OSError:
+        pass
+
+    return {
+        "agent_type": agent_type,
+        "description": description,
+        "message_count": message_count,
+        "first_prompt": first_prompt,
+        "first_message_at": first_ts,
+        "last_message_at": last_ts,
+    }
+
+
+def parse_subagent_conversation(jsonl_path: str) -> list[dict]:
+    """Parse a subagent JSONL file into a list of turns for display.
+
+    Returns a list of dicts with: turn_number, role, text, timestamp, tools.
+    """
+    messages = []
+    try:
+        with open(jsonl_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                msg_type = obj.get("type")
+                if msg_type not in ("user", "assistant"):
+                    continue
+                messages.append(obj)
+    except OSError:
+        return []
+
+    # Group assistant messages by requestId (same dedup as main sessions)
+    messages = group_assistant_messages(messages)
+
+    turns = []
+    turn_number = 0
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        if msg.get("type") == "user":
+            user_text = extract_text_content(msg)
+            user_ts = msg.get("timestamp")
+            # Look for following assistant message
+            asst_text = ""
+            asst_tools = ""
+            if i + 1 < len(messages) and messages[i + 1].get("type") == "assistant":
+                asst = messages[i + 1]
+                asst_text = extract_text_content(asst)
+                asst_tools = extract_tool_summary(asst)
+                i += 1
+            turns.append({
+                "turn_number": turn_number,
+                "user_content": user_text,
+                "assistant_content": asst_text,
+                "tools": asst_tools,
+                "timestamp": user_ts,
+            })
+            turn_number += 1
+        elif msg.get("type") == "assistant":
+            # Assistant without preceding user (tool result flow)
+            turns.append({
+                "turn_number": turn_number,
+                "user_content": "",
+                "assistant_content": extract_text_content(msg),
+                "tools": extract_tool_summary(msg),
+                "timestamp": msg.get("timestamp"),
+            })
+            turn_number += 1
+        i += 1
+
+    return turns
 
 
 def group_assistant_messages(messages: list[dict]) -> list[dict]:

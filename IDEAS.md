@@ -134,28 +134,55 @@ Migrated chat-search to use [limbic](https://github.com/houshuang/limbic) for em
 - `dedup_by()` utility for group-by deduplication of search results
 - 15 new tests
 
+### Phase 5: Subagent access & repo-aware grouping ✓ (2026-03-26)
+
+Motivated by a real failure: finding the conversation behind PR #2925 took 6+ failed semantic searches before discovering `--grep "2925"` worked instantly. The detailed failure data lived in a subagent conversation with no native access path.
+
+#### Changes made
+
+- **5a. Subagent metadata indexing** — lightweight `subagents` table stores agent type, first prompt, message count, and file path. No chunks or embeddings (avoids the Phase 3 noise problem). Full conversation content read on-demand from JSONL. 4,772 records indexed.
+- **5b. `subagents` command** — lists all background agent conversations for a session with type, message count, size, and first prompt preview.
+- **5c. `subagent` command** — displays the full conversation of a specific subagent with partial ID matching. `--raw` flag for untruncated output.
+- **5d. Enhanced `show`** — header shows subagent count; `--with-subagents` flag appends subagent summaries.
+- **5e. Git remote detection** — detects `git remote get-url origin` for each project path, normalizes to `owner/repo`, caches permanently in `~/.claude-chat-search/git-remotes.json`. 1,078 sessions backfilled.
+- **5f. Transparent `--project` expansion** — when `--project pol3` matches sessions with a git_remote, the filter auto-expands to include ALL project paths sharing that remote. Zero configuration needed.
+- **5g. Skill file search strategy** — added "identifier-first rule": when searching for PR numbers, branch names, error messages etc., always use `--grep` first. Semantic search is for vague topic recall only.
+
+#### Results
+
+| Metric | Before (Phase 4) | After (Phase 5) |
+|--------|-------------------|-----------------|
+| Sessions | ~1,000 | 1,317 |
+| Subagent metadata | 0 | 4,772 records |
+| Git remotes cached | 0 | 44 entries |
+| `--project pol3` coverage | 1 folder | 9 folders (auto-expanded) |
+
+#### Key decision: metadata-only indexing for subagents
+
+Phase 3 dropped subagent indexing because 112K chunks consumed 91% of embeddings. Phase 5 restores subagent *discoverability* via a lightweight metadata table without re-introducing the noise problem. The `subagent` command reads full conversations on-demand from JSONL files, so no re-parsing or embedding is needed.
+
 ## Remaining
 
-### Phase 5: Search quality analysis
+### Phase 6: Search quality analysis
 
-**5a. Analyze search logs** — now that we're logging queries + results, analyze patterns after 1-2 weeks of usage:
+**6a. Analyze search logs** — now that we're logging queries + results, analyze patterns after 1-2 weeks of usage:
 - What queries return 0 results? (missing coverage)
 - Do users retry with different wording? (search quality signal)
 - How often are `--grep` / `--since` / `--project` filters used?
 - Is semantic search adding value over FTS5 alone?
 
-**5b. Session-level topic extraction** — instead of (or in addition to) embedding every chunk, extract keywords/topics per session at index time. Could enable:
+**6b. Session-level topic extraction** — instead of (or in addition to) embedding every chunk, extract keywords/topics per session at index time. Could enable:
 - Faster search (no embedding API call for query)
 - Better session-level relevance ranking
 - Topic browsing / clustering
 
-**5c. Evaluate search result format**
+**6c. Evaluate search result format**
 - Current format truncates user to 300 chars, assistant to 500 chars, plus 3-4 lines metadata
 - `recover` command already solves the compact-output need for context recovery
 - A `--json` flag was considered but may not be needed — current format is LLM-parseable
 - Decision: monitor search logs for patterns where LLM always calls `show` after `search` (meaning preview wasn't sufficient). If common, add more content per result or a compact mode. Otherwise leave as-is.
 
-**5d. Consider whitening for chat embeddings**
+**6d. Consider whitening for chat embeddings**
 - limbic supports Soft-ZCA whitening (+32% NN-separation on domain corpora)
 - Chat search corpus is domain-diverse (all projects), so whitening might hurt
 - Worth testing: fit whitening on per-project subsets vs. full corpus vs. no whitening
@@ -171,3 +198,6 @@ Migrated chat-search to use [limbic](https://github.com/houshuang/limbic) for em
 - Keep embeddings for now but monitor via search logs whether FTS5 alone is sufficient
 - After VACUUM + vec rebuild: sqlite-vec doesn't release space on delete, must drop+recreate table
 - Foreign key constraint: when doing `--all --force` re-index, must disable FK or delete chunks before sessions
+- ~~Drop subagent indexing entirely~~ → **Re-introduce as metadata-only (Phase 5)**: subagent chunks were noise (Phase 3), but subagent *metadata* (type, first prompt, message count) is cheap and enables drill-down. Full conversations read on-demand from JSONL.
+- Git remote cache is permanent (JSON file) because remotes don't change per directory. No expiry needed.
+- `--project` expansion via git remote is transparent — no separate `--repo` flag needed. Users just use `--project` and it works across multiple checkouts automatically.
