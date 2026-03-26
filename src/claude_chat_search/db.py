@@ -6,7 +6,7 @@ import sqlite_vec
 
 DB_DIR = Path.home() / ".claude-chat-search"
 DB_PATH = DB_DIR / "index.db"
-EMBEDDING_DIM = 1536
+EMBEDDING_DIM = 384
 
 
 def get_connection() -> apsw.Connection:
@@ -63,6 +63,7 @@ def init_db(conn: apsw.Connection) -> None:
         ("tools_used", "TEXT"),
         ("commands_run", "TEXT"),
         ("parent_session_id", "TEXT"),
+        ("topic_summary", "TEXT"),
     ]:
         try:
             conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} {col_type}")
@@ -128,11 +129,23 @@ def serialize_embedding(embedding: list[float]) -> bytes:
 
 def insert_session(conn: apsw.Connection, session: dict) -> None:
     conn.execute(
-        """INSERT OR REPLACE INTO sessions
+        """INSERT INTO sessions
            (session_id, project_path, slug, git_branch,
             first_message_at, last_message_at, message_count, indexed_at,
             files_touched, tools_used, commands_run, parent_session_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(session_id) DO UPDATE SET
+            project_path=excluded.project_path,
+            slug=excluded.slug,
+            git_branch=excluded.git_branch,
+            first_message_at=excluded.first_message_at,
+            last_message_at=excluded.last_message_at,
+            message_count=excluded.message_count,
+            indexed_at=excluded.indexed_at,
+            files_touched=excluded.files_touched,
+            tools_used=excluded.tools_used,
+            commands_run=excluded.commands_run,
+            parent_session_id=excluded.parent_session_id""",
         (
             session["session_id"],
             session["project_path"],
@@ -176,10 +189,13 @@ def insert_chunks(conn: apsw.Connection, chunks: list[dict]) -> list[int]:
 def insert_embeddings(conn: apsw.Connection, chunk_ids: list[int], embeddings: list[list[float]]) -> None:
     for chunk_id, emb in zip(chunk_ids, embeddings):
         conn.execute(
-            "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?, ?)",
+            "INSERT OR REPLACE INTO vec_chunks (chunk_id, embedding) VALUES (?, ?)",
             (chunk_id, serialize_embedding(emb)),
         )
         conn.execute("UPDATE chunks SET embedded = 1 WHERE id = ?", (chunk_id,))
+    # Invalidate numpy search cache so it picks up new embeddings
+    from .vector_search import invalidate_cache
+    invalidate_cache()
 
 
 def delete_session_data(conn: apsw.Connection, session_id: str) -> None:
@@ -188,6 +204,8 @@ def delete_session_data(conn: apsw.Connection, session_id: str) -> None:
         conn.execute("DELETE FROM vec_chunks WHERE chunk_id = ?", (cid,))
     conn.execute("DELETE FROM chunks WHERE session_id = ?", (session_id,))
     conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+    from .vector_search import invalidate_cache
+    invalidate_cache()
 
 
 def get_unembedded_chunks(conn: apsw.Connection, batch_size: int = 100) -> list[dict]:
@@ -213,23 +231,11 @@ def vector_search(conn: apsw.Connection, query_embedding: list[float], limit: in
 def _sanitize_fts_query(query: str) -> str:
     """Build a safe FTS5 query from user input.
 
-    Each word is double-quoted to prevent FTS5 from interpreting hyphens,
-    slashes, or reserved words (OR/AND/NOT/NEAR) as operators or column prefixes.
+    Uses limbic's sanitization: extract unicode word tokens, filter noise,
+    quote each to prevent reserved word interpretation (AND/OR/NOT/NEAR).
     """
-    import re
-
-    words = query.split()
-    quoted = []
-    for word in words:
-        word = word.strip()
-        if not word:
-            continue
-        # Strip characters that are problematic even inside FTS5 quotes
-        cleaned = re.sub(r'["\(\)\*]', " ", word).strip()
-        if not cleaned:
-            continue
-        quoted.append(f'"{cleaned}"')
-    return " OR ".join(quoted)
+    from limbic.amygdala.search import FTS5Index
+    return FTS5Index._sanitize_query(query)
 
 
 def fts_search(conn: apsw.Connection, query: str, limit: int = 20) -> list[dict]:
@@ -321,4 +327,54 @@ def get_stats(conn: apsw.Connection) -> dict:
     sessions = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
     chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
     embedded = conn.execute("SELECT COUNT(*) FROM chunks WHERE embedded = 1").fetchone()[0]
-    return {"sessions": sessions, "chunks": chunks, "embedded": embedded}
+    summarized = conn.execute(
+        "SELECT COUNT(*) FROM sessions WHERE topic_summary IS NOT NULL"
+    ).fetchone()[0]
+    return {"sessions": sessions, "chunks": chunks, "embedded": embedded,
+            "summarized": summarized}
+
+
+def get_sessions_without_summary(conn: apsw.Connection, limit: int = 50) -> list[dict]:
+    """Get sessions that don't have a topic summary yet, ordered by most recent first."""
+    return _fetchall(
+        conn,
+        """SELECT session_id, project_path, slug, message_count
+           FROM sessions
+           WHERE topic_summary IS NULL AND message_count > 2
+           ORDER BY last_message_at DESC
+           LIMIT ?""",
+        (limit,),
+    )
+
+
+def update_topic_summary(conn: apsw.Connection, session_id: str, summary: str) -> None:
+    conn.execute(
+        "UPDATE sessions SET topic_summary = ? WHERE session_id = ?",
+        (summary, session_id),
+    )
+
+
+def get_topic_summary(conn: apsw.Connection, session_id: str) -> str | None:
+    row = conn.execute(
+        "SELECT topic_summary FROM sessions WHERE session_id = ?",
+        (session_id,),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def migrate_vec_table(conn: apsw.Connection) -> int:
+    """Drop old vec_chunks table, recreate with current EMBEDDING_DIM, mark all chunks for re-embedding.
+
+    Returns the number of chunks marked for re-embedding.
+    """
+    conn.execute("DROP TABLE IF EXISTS vec_chunks")
+    conn.execute(f"""
+        CREATE VIRTUAL TABLE vec_chunks USING vec0(
+            chunk_id INTEGER PRIMARY KEY,
+            embedding FLOAT[{EMBEDDING_DIM}]
+        )
+    """)
+    conn.execute("UPDATE chunks SET embedded = 0")
+    from .vector_search import invalidate_cache
+    invalidate_cache()
+    return conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]

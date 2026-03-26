@@ -1,5 +1,6 @@
-from .db import file_search as db_file_search, fts_search, get_chunks_by_ids, text_search, vector_search
+from .db import file_search as db_file_search, fts_search, get_chunks_by_ids, text_search
 from .embedder import embed_query
+from .vector_search import numpy_vector_search
 
 RRF_K = 60
 
@@ -61,6 +62,7 @@ def hybrid_search(
     branch: str | None = None,
     since: str | None = None,
     before: str | None = None,
+    do_rerank: bool = False,
 ) -> list[dict]:
     """Run hybrid semantic + keyword search with RRF merging.
 
@@ -71,7 +73,7 @@ def hybrid_search(
     fetch_limit = limit * 5
 
     query_embedding = embed_query(query)
-    vec_results = vector_search(conn, query_embedding, limit=fetch_limit)
+    vec_results = numpy_vector_search(conn, query_embedding, limit=fetch_limit)
     fts_results = fts_search(conn, query, limit=fetch_limit)
 
     fused = reciprocal_rank_fusion([vec_results, fts_results])
@@ -111,7 +113,28 @@ def hybrid_search(
         if len(seen_sessions) >= limit:
             break
 
-    return list(seen_sessions.values())
+    results = list(seen_sessions.values())
+
+    if do_rerank and results:
+        from limbic.amygdala import Result as LimbicResult, rerank
+        limbic_results = [
+            LimbicResult(
+                id=str(r["chunk_id"]),
+                score=r["score"],
+                content=(r.get("user_content", "") + "\n" + r.get("assistant_content", "")),
+                source="hybrid",
+            )
+            for r in results
+        ]
+        reranked = rerank(query, limbic_results)
+        result_map = {str(r["chunk_id"]): r for r in results}
+        results = []
+        for lr in reranked:
+            orig = result_map[lr.id]
+            orig["score"] = lr.score
+            results.append(orig)
+
+    return results
 
 
 def grep_search(

@@ -1,4 +1,6 @@
+import json
 import sys
+import time as _time
 from datetime import datetime, timezone
 
 import click
@@ -13,6 +15,7 @@ from .db import (
     get_session,
     get_session_chunks,
     get_stats,
+    get_topic_summary,
     init_db,
     insert_chunks,
     insert_session,
@@ -60,8 +63,12 @@ def index(index_all, force):
                 embedding FLOAT[{EMBEDDING_DIM}]
             )
         """)
+        conn.execute("PRAGMA foreign_keys=OFF")
         conn.execute("DELETE FROM chunks")
         conn.execute("DELETE FROM sessions")
+        conn.execute("PRAGMA foreign_keys=ON")
+        from .vector_search import invalidate_cache
+        invalidate_cache()
 
     _run_index(conn, force=force or index_all)
     _run_embed(conn)
@@ -96,6 +103,34 @@ def _parse_date(value: str) -> str:
     return value
 
 
+def _log_search(query: str, mode: str, results: list[dict], latency_ms: float,
+                 filters: dict | None = None):
+    """Append a JSON line to the search log with result details."""
+    entry = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "query": query,
+        "mode": mode,
+        "results": len(results),
+        "ms": round(latency_ms, 1),
+        "hits": [
+            {
+                "session": r["session_id"][:12],
+                "score": round(r["score"], 4),
+                "project": (r.get("project_path") or "").rsplit("/", 1)[-1],
+                "turn": r.get("turn_number", 0),
+            }
+            for r in results
+        ],
+    }
+    if filters:
+        entry["filters"] = filters
+    try:
+        with open(DB_PATH.parent / "search.log", "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError:
+        pass
+
+
 @cli.command()
 @click.argument("query")
 @click.option("--limit", "-n", default=10, help="Number of results")
@@ -105,7 +140,8 @@ def _parse_date(value: str) -> str:
 @click.option("--before", default=None, help="Only results before date (YYYY-MM-DD, 3d, 2w, 1m)")
 @click.option("--grep", "grep_mode", is_flag=True, help="Exact substring search (no semantic/FTS5)")
 @click.option("--file", "file_mode", is_flag=True, help="Search by file path in session metadata")
-def search(query, limit, project, branch, since, before, grep_mode, file_mode):
+@click.option("--rerank", "do_rerank", is_flag=True, help="Re-score with cross-encoder (slower, more accurate)")
+def search(query, limit, project, branch, since, before, grep_mode, file_mode, do_rerank):
     """Search past conversations."""
     from .search import file_search, grep_search, hybrid_search
 
@@ -115,6 +151,9 @@ def search(query, limit, project, branch, since, before, grep_mode, file_mode):
     since_iso = _parse_date(since) if since else None
     before_iso = _parse_date(before) if before else None
 
+    mode = "file" if file_mode else "grep" if grep_mode else "hybrid"
+    t0 = _time.monotonic()
+
     if file_mode:
         results = file_search(conn, query, limit=limit, project=project,
                               branch=branch, since=since_iso, before=before_iso)
@@ -123,7 +162,20 @@ def search(query, limit, project, branch, since, before, grep_mode, file_mode):
                               branch=branch, since=since_iso, before=before_iso)
     else:
         results = hybrid_search(conn, query, limit=limit, project=project,
-                                branch=branch, since=since_iso, before=before_iso)
+                                branch=branch, since=since_iso, before=before_iso,
+                                do_rerank=do_rerank)
+
+    filters = {}
+    if project:
+        filters["project"] = project
+    if branch:
+        filters["branch"] = branch
+    if since:
+        filters["since"] = since
+    if before:
+        filters["before"] = before
+    _log_search(query, mode, results, (_time.monotonic() - t0) * 1000,
+                filters or None)
 
     if not results:
         click.echo("No results found.")
@@ -146,6 +198,11 @@ def search(query, limit, project, branch, since, before, grep_mode, file_mode):
             meta_parts.append(f"branch: {r['git_branch']}")
         for m in meta_parts:
             click.echo(f"    {m}")
+
+        # Topic summary
+        summary = get_topic_summary(conn, r["session_id"])
+        if summary:
+            click.echo(f"    summary: {summary}")
 
         # Time and depth
         depth_parts = []
@@ -242,6 +299,215 @@ def show(session_id, turn, context):
     conn.close()
 
 
+@cli.command()
+@click.argument("session_id", required=False, default=None)
+@click.option("--turns", "-n", default=20, help="Number of recent turns to show")
+def recover(session_id, turns):
+    """Recover recent context from a session (for use after compact).
+
+    Outputs the most recent turns in a compact LLM-friendly format.
+    Supports partial session ID matching.
+    """
+    conn = get_connection()
+    init_db(conn)
+
+    if session_id is None:
+        click.echo("Usage: claude-chat-search recover SESSION_ID", err=True)
+        conn.close()
+        return
+
+    # Support partial session ID matching
+    session = get_session(conn, session_id)
+    if session is None:
+        rows = _fetchall(
+            conn,
+            "SELECT * FROM sessions WHERE session_id LIKE ?",
+            (f"{session_id}%",),
+        )
+        if len(rows) == 1:
+            session = rows[0]
+        elif len(rows) > 1:
+            click.echo(f"Multiple sessions match '{session_id}':", err=True)
+            for r in rows:
+                click.echo(f"  {r['session_id']}  {r['project_path']}", err=True)
+            conn.close()
+            return
+        else:
+            click.echo(f"Session '{session_id}' not found.", err=True)
+            conn.close()
+            return
+
+    chunks = get_session_chunks(conn, session["session_id"])
+    recent = chunks[-turns:] if len(chunks) > turns else chunks
+
+    click.echo(f"Session: {session['session_id']}")
+    click.echo(f"Project: {session['project_path']}")
+    if session["slug"]:
+        click.echo(f"Slug: {session['slug']}")
+    duration = _format_duration(session["first_message_at"], session["last_message_at"])
+    time_str = _format_time(session["first_message_at"])
+    if duration:
+        time_str += f" ({duration})"
+    click.echo(f"Time: {time_str}")
+    click.echo(f"Showing: last {len(recent)} of {len(chunks)} turns")
+    click.echo("")
+
+    for chunk in recent:
+        click.echo(f"[Turn {chunk['turn_number']}]")
+        if chunk["user_content"]:
+            click.echo(f"U: {_truncate(chunk['user_content'], 500)}")
+        if chunk["assistant_content"]:
+            click.echo(f"A: {_truncate(chunk['assistant_content'], 800)}")
+        click.echo("")
+
+    conn.close()
+
+
+@cli.command()
+def reembed():
+    """Migrate to new embedding model: drop old vectors, re-embed all chunks."""
+    from .db import migrate_vec_table
+    from .embedder import process_embeddings
+
+    conn = get_connection()
+    init_db(conn)
+
+    stats_before = get_stats(conn)
+    click.echo(f"Before: {stats_before['chunks']} chunks, {stats_before['embedded']} embedded")
+
+    click.echo("Dropping old vec_chunks table and recreating with 384-dim...")
+    count = migrate_vec_table(conn)
+    click.echo(f"Marked {count} chunks for re-embedding.")
+
+    click.echo("Re-embedding all chunks with paraphrase-multilingual-MiniLM-L12-v2 (via limbic)...")
+
+    def progress(total):
+        click.echo(f"  Embedded {total}/{count} chunks...", err=True)
+
+    total = process_embeddings(conn, callback=progress)
+
+    stats_after = get_stats(conn)
+    click.echo(f"\nDone: {stats_after['embedded']}/{stats_after['chunks']} chunks embedded.")
+    conn.close()
+
+
+@cli.command()
+@click.option("--all", "summarize_all", is_flag=True, help="Summarize all sessions without summaries")
+@click.option("--limit", "-n", default=50, help="Max sessions to summarize (default: 50)")
+def summarize(summarize_all, limit):
+    """Generate topic summaries for sessions using Gemini Flash."""
+    from .summarizer import summarize_sessions
+
+    conn = get_connection()
+    init_db(conn)
+
+    stats = get_stats(conn)
+    unsummarized = stats["sessions"] - stats["summarized"]
+    click.echo(f"Sessions: {stats['sessions']} total, {stats['summarized']} summarized, {unsummarized} remaining")
+
+    if unsummarized == 0:
+        click.echo("All sessions already summarized.")
+        conn.close()
+        return
+
+    effective_limit = unsummarized if summarize_all else limit
+    click.echo(f"Summarizing up to {effective_limit} sessions...")
+
+    def progress(sid, summary, count):
+        click.echo(f"  [{count}] {sid[:12]}... {summary[:80]}{'...' if len(summary) > 80 else ''}", err=True)
+
+    count = summarize_sessions(conn, limit=effective_limit, callback=progress)
+
+    stats = get_stats(conn)
+    click.echo(f"\nDone: summarized {count} sessions ({stats['summarized']}/{stats['sessions']} total)")
+    conn.close()
+
+
+@cli.command()
+@click.argument("query")
+@click.option("--limit", "-n", default=10, help="Number of results")
+@click.option("--project", "-p", default=None, help="Filter by project path substring")
+@click.option("--branch", "-b", default=None, help="Filter by git branch name substring")
+@click.option("--since", default=None, help="Only results after date (YYYY-MM-DD, 3d, 2w, 1m)")
+@click.option("--before", default=None, help="Only results before date (YYYY-MM-DD, 3d, 2w, 1m)")
+def cross(query, limit, project, branch, since, before):
+    """Search both chat history and research index."""
+    from .cross_search import cross_search
+
+    conn = get_connection()
+    init_db(conn)
+
+    since_iso = _parse_date(since) if since else None
+    before_iso = _parse_date(before) if before else None
+
+    t0 = _time.monotonic()
+    results = cross_search(conn, query, limit=limit, project=project,
+                           branch=branch, since=since_iso, before=before_iso)
+    elapsed = (_time.monotonic() - t0) * 1000
+
+    if not results:
+        click.echo("No results found.")
+        conn.close()
+        return
+
+    click.echo(f"Cross-search: {len(results)} results in {elapsed:.0f}ms\n")
+
+    for i, r in enumerate(results, 1):
+        click.echo(f"{'='*70}")
+        source_label = f"[{r['source']}]"
+
+        if r["source"] == "chat":
+            click.echo(f"#{i}  {source_label}  score={r['score']:.4f}  session={r['session_id'][:12]}...")
+
+            meta_parts = []
+            if r.get("project_path"):
+                meta_parts.append(f"project: {r['project_path']}")
+            if r.get("slug"):
+                meta_parts.append(f"slug: {r['slug']}")
+            if r.get("git_branch"):
+                meta_parts.append(f"branch: {r['git_branch']}")
+            for m in meta_parts:
+                click.echo(f"    {m}")
+
+            # Show topic summary if available
+            summary = get_topic_summary(conn, r["session_id"])
+            if summary:
+                click.echo(f"    summary: {summary}")
+
+            depth_parts = []
+            if r.get("timestamp"):
+                depth_parts.append(f"time: {_format_time(r['timestamp'])}")
+            if r.get("message_count"):
+                depth_parts.append(f"{r['message_count']} messages")
+            duration = _format_duration(r.get("first_message_at"), r.get("last_message_at"))
+            if duration:
+                depth_parts.append(duration)
+            if depth_parts:
+                click.echo(f"    {' · '.join(depth_parts)}")
+
+            click.echo(f"\n  [Turn {r['turn_number']}]")
+            user = _truncate(r.get("user_content", ""), 300)
+            assistant = _truncate(r.get("assistant_content", ""), 500)
+            if user:
+                click.echo(f"  User: {user}")
+            if assistant:
+                click.echo(f"  Assistant: {assistant}")
+
+        elif r["source"] == "research":
+            from pathlib import Path
+            fname = Path(r["source_file"]).name
+            sec = f" > {r['section']}" if r.get("section") else ""
+            click.echo(f"#{i}  {source_label}  score={r['score']:.4f}  {fname}{sec}")
+            click.echo(f"    file: {r['source_file']}")
+            content_preview = _truncate(r.get("content", ""), 400)
+            if content_preview:
+                click.echo(f"  {content_preview}")
+
+        click.echo()
+
+    conn.close()
+
+
 @cli.group()
 def daemon():
     """Manage the indexer daemon."""
@@ -296,8 +562,10 @@ def _run_index(conn, force: bool = False) -> int:
                     skip_count += 1
                     continue
 
-            # Re-index this session
+            # Re-index this session (preserve topic_summary across re-index)
+            saved_summary = None
             if sid in indexed:
+                saved_summary = get_topic_summary(conn, sid)
                 delete_session_data(conn, sid)
 
             try:
@@ -318,6 +586,9 @@ def _run_index(conn, force: bool = False) -> int:
             session_data.update(metadata)
 
             insert_session(conn, session_data)
+            if saved_summary:
+                from .db import update_topic_summary
+                update_topic_summary(conn, sid, saved_summary)
             chunks = create_chunks(session_data)
             if chunks:
                 insert_chunks(conn, chunks)
@@ -343,14 +614,9 @@ def _run_embed(conn) -> int:
     def progress(total):
         click.echo(f"  Embedded {total} chunks so far...", err=True)
 
-    try:
-        total = process_embeddings(conn, callback=progress)
-        click.echo(f"Embedded {total} chunks.", err=True)
-        return total
-    except RuntimeError as e:
-        click.echo(f"Embedding skipped: {e}", err=True)
-        click.echo("Set OPENAI_API_KEY to enable semantic search. Keyword search still works.", err=True)
-        return 0
+    total = process_embeddings(conn, callback=progress)
+    click.echo(f"Embedded {total} chunks.", err=True)
+    return total
 
 
 def _truncate(text: str, max_len: int) -> str:

@@ -28,21 +28,44 @@ QUEUE_PROCESSING = DB_DIR / ".queue.processing"
 PID_FILE = DB_DIR / "daemon.pid"
 LOG_FILE = DB_DIR / "daemon.log"
 POLL_INTERVAL = 2
+COOLDOWN_SECONDS = 60
+ACTIVE_COOLDOWN_SECONDS = 300  # 5 min for sessions that keep changing
+EMBED_INTERVAL = 30
+WAL_CHECKPOINT_INTERVAL = 600  # 10 minutes
+REINDEX_WINDOW = 600  # 10 min window for counting re-indexes
 
 logger = logging.getLogger("claude-chat-search-daemon")
 
 # Module-level shutdown flag so signal handler can interrupt long operations
 _shutdown = False
+_last_indexed: dict[str, float] = {}  # session_id -> monotonic time of last index
+_file_fingerprints: dict[str, tuple[float, int]] = {}  # session_id -> (mtime, size)
+_reindex_times: dict[str, list[float]] = {}  # session_id -> list of recent index times
+
+
+def _get_file_fingerprint(path) -> tuple[float, int]:
+    """Return (mtime, size) for a file path."""
+    try:
+        st = os.stat(path)
+        return (st.st_mtime, st.st_size)
+    except OSError:
+        return (0.0, 0)
 
 
 def index_single_session(conn, file_info: dict) -> bool:
-    """Index a single session file. Skips if message_count unchanged. Returns True if indexed."""
+    """Index a single session file. Skips if file unchanged (mtime+size). Returns True if indexed."""
     sid = file_info["session_id"]
+    path = file_info["path"]
+
+    # Check file fingerprint first — avoids parsing the file at all if unchanged
+    current_fp = _get_file_fingerprint(path)
+    if current_fp == _file_fingerprints.get(sid):
+        return False
 
     try:
-        session_data = parse_jsonl_file(file_info["path"])
+        session_data = parse_jsonl_file(path)
     except Exception as e:
-        logger.error(f"Error parsing {file_info['path']}: {e}")
+        logger.error(f"Error parsing {path}: {e}")
         return False
 
     if not session_data["messages"]:
@@ -50,6 +73,8 @@ def index_single_session(conn, file_info: dict) -> bool:
 
     existing = get_session(conn, sid)
     if existing and existing["message_count"] == session_data["message_count"]:
+        # File changed but message_count didn't — update fingerprint, skip re-index
+        _file_fingerprints[sid] = current_fp
         return False
 
     if existing:
@@ -68,7 +93,35 @@ def index_single_session(conn, file_info: dict) -> bool:
     if chunks:
         insert_chunks(conn, chunks)
 
+    _file_fingerprints[sid] = current_fp
     return True
+
+
+def _get_cooldown(sid: str) -> float:
+    """Compute cooldown for a session based on how often it's been re-indexed recently.
+
+    Sessions re-indexed 3+ times in the last 10 minutes are "hot" (active sessions)
+    and get a 5-minute cooldown. Sessions indexed once or twice keep the 60s default.
+    """
+    now = time.monotonic()
+    times = _reindex_times.get(sid, [])
+    # Prune old entries outside the window
+    times = [t for t in times if now - t < REINDEX_WINDOW]
+    _reindex_times[sid] = times
+
+    if len(times) >= 3:
+        return ACTIVE_COOLDOWN_SECONDS
+    return COOLDOWN_SECONDS
+
+
+def _record_reindex(sid: str):
+    """Record that a session was just re-indexed."""
+    now = time.monotonic()
+    times = _reindex_times.get(sid, [])
+    times.append(now)
+    # Keep only entries within the window
+    times = [t for t in times if now - t < REINDEX_WINDOW]
+    _reindex_times[sid] = times
 
 
 def process_queue(conn) -> int:
@@ -98,52 +151,64 @@ def process_queue(conn) -> int:
         file_info = file_info_from_path(transcript_path)
         if file_info is None:
             continue
+        sid = file_info["session_id"]
+        now = time.monotonic()
+
+        cooldown = _get_cooldown(sid)
+        if now - _last_indexed.get(sid, 0) < cooldown:
+            continue
         if index_single_session(conn, file_info):
+            _last_indexed[sid] = time.monotonic()
+            _record_reindex(sid)
             indexed += 1
-            logger.info(f"Indexed {file_info['session_id']}")
+            logger.info(f"Indexed {sid} (cooldown={int(cooldown)}s)")
 
     return indexed
 
 
 def full_scan(conn) -> int:
-    """Full scan using iter_jsonl_files, skip unchanged via message_count."""
+    """Full scan using iter_jsonl_files, skip unchanged via file fingerprint + message_count."""
     files = iter_jsonl_files()
     indexed = 0
     for file_info in files:
         if _shutdown:
             break
         if index_single_session(conn, file_info):
+            sid = file_info["session_id"]
+            _record_reindex(sid)
+            _last_indexed[sid] = time.monotonic()
             indexed += 1
     return indexed
 
 
 def run_embeddings(conn):
     """Run embedding pipeline in batches, checking shutdown between batches."""
-    try:
-        from .embedder import get_client, embed_texts
-        from .db import insert_embeddings
-    except RuntimeError:
-        return
-
-    try:
-        client = get_client()
-    except RuntimeError:
-        return
+    from .embedder import embed_texts
+    from .db import insert_embeddings
 
     while not _shutdown:
-        rows = get_unembedded_chunks(conn, 100)
+        rows = get_unembedded_chunks(conn, 256)
         if not rows:
             break
 
-        texts = [r["combined_text"][:8000] for r in rows]
+        texts = [r["combined_text"] for r in rows]
         chunk_ids = [r["id"] for r in rows]
 
         try:
-            embeddings = embed_texts(client, texts)
+            embeddings = embed_texts(texts)
             insert_embeddings(conn, chunk_ids, embeddings)
         except Exception:
             logger.exception("Embedding batch failed")
             break
+
+
+def wal_checkpoint(conn):
+    """Run a WAL checkpoint to prevent unbounded WAL growth."""
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        logger.debug("WAL checkpoint completed")
+    except Exception:
+        logger.exception("WAL checkpoint failed")
 
 
 def is_running() -> int | None:
@@ -172,9 +237,6 @@ def run():
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    # Suppress noisy HTTP request logs from OpenAI/httpx
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("openai").setLevel(logging.WARNING)
     # Also log to stderr when running interactively
     if sys.stderr.isatty():
         logging.getLogger().addHandler(logging.StreamHandler())
@@ -208,20 +270,39 @@ def run():
         if count > 0:
             run_embeddings(conn)
 
+    last_embed_time = time.monotonic()
+    last_wal_checkpoint = time.monotonic()
+
     while not _shutdown:
         try:
             indexed = process_queue(conn)
             if indexed > 0:
                 logger.info(f"Queue batch: indexed {indexed} sessions")
-                run_embeddings(conn)
         except Exception:
             logger.exception("Error processing queue")
+
+        # Run embeddings on a separate timer, independent of indexing
+        now = time.monotonic()
+        if now - last_embed_time >= EMBED_INTERVAL:
+            try:
+                run_embeddings(conn)
+            except Exception:
+                logger.exception("Error running embeddings")
+            last_embed_time = time.monotonic()
+
+        # Periodic WAL checkpoint to prevent unbounded WAL growth
+        now = time.monotonic()
+        if now - last_wal_checkpoint >= WAL_CHECKPOINT_INTERVAL:
+            wal_checkpoint(conn)
+            last_wal_checkpoint = time.monotonic()
 
         for _ in range(POLL_INTERVAL * 10):
             if _shutdown:
                 break
             time.sleep(0.1)
 
+    # Final WAL checkpoint before exit
+    wal_checkpoint(conn)
     conn.close()
     try:
         PID_FILE.unlink()

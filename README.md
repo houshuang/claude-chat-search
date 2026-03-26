@@ -1,16 +1,16 @@
 # claude-chat-search
 
-Semantic search over your past Claude Code conversations. Indexes the JSONL conversation logs in `~/.claude/projects/` into a local SQLite database with hybrid search — full-text keyword search (FTS5) and vector similarity search (via `sqlite-vec` + OpenAI embeddings), combined using Reciprocal Rank Fusion.
+Semantic search over your past Claude Code conversations. Indexes the JSONL conversation logs in `~/.claude/projects/` into a local SQLite database with hybrid search — full-text keyword search (FTS5) and vector similarity search (via [limbic](https://github.com/houshuang/limbic)), combined using Reciprocal Rank Fusion.
 
 ## Install
 
 ```bash
-git clone https://github.com/houshuang/claude-chat-search.git
-cd claude-chat-search
-uv pip install -e .
+git clone https://github.com/houshuang/claude-tool.git
+cd claude-tool/claude-chat-search
+uv venv && uv pip install -e .
 ```
 
-Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/). Keyword search works out of the box. For semantic (vector) search, set `OPENAI_API_KEY` in your environment.
+Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/). All search modes (keyword, semantic, reranking) work locally — no API keys needed.
 
 ## Usage
 
@@ -20,7 +20,7 @@ Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/). Keyword search works
 claude-chat-search init
 ```
 
-Creates the database at `~/.claude-chat-search/index.db`, indexes all existing conversations, and generates embeddings.
+Creates the database at `~/.claude-chat-search/index.db`, indexes all existing conversations, and generates embeddings using a local model (`paraphrase-multilingual-MiniLM-L12-v2`, 384-dim).
 
 ### Incremental indexing
 
@@ -36,6 +36,8 @@ Only indexes new or modified sessions since the last run. Use `--all --force` to
 claude-chat-search search "how to configure webhooks"
 claude-chat-search search "deployment error" --project myapp --since 2w
 claude-chat-search search "database migration" -n 5 --branch main
+claude-chat-search search "exact error message" --grep
+claude-chat-search search "important query" --rerank
 ```
 
 Options:
@@ -46,6 +48,7 @@ Options:
 - `--before` — only results before date
 - `--grep` — exact substring search (skips semantic/FTS5, just matches raw text)
 - `--file` — search by file path mentioned in session tool calls
+- `--rerank` — re-score results with a cross-encoder for better relevance (slower, +5-15% accuracy)
 
 ### Inspect a session
 
@@ -123,8 +126,9 @@ Then Claude Code will search your past conversations when you ask things like "r
 
 - **parser.py** — walks `~/.claude/projects/` and parses JSONL conversation logs; extracts git branch, slug, file paths, and message counts from session metadata and tool calls
 - **chunker.py** — splits conversations into user/assistant turn pairs with token-aware splitting and paragraph-boundary overlap
-- **embedder.py** — generates OpenAI `text-embedding-3-small` embeddings in batches
-- **db.py** — SQLite with FTS5 for keyword search and `sqlite-vec` for vector search
-- **search.py** — hybrid search (vector + keyword + grep + file) combined via Reciprocal Rank Fusion, deduplicated by session
+- **embedder.py** — generates embeddings via [limbic](https://github.com/houshuang/limbic)'s `EmbeddingModel` (`paraphrase-multilingual-MiniLM-L12-v2`, local, multilingual, 384-dim)
+- **vector_search.py** — in-memory numpy vector search using limbic's `VectorIndex` with module-level caching
+- **db.py** — SQLite with FTS5 for keyword search and `sqlite-vec` for vector storage
+- **search.py** — hybrid search (vector + keyword + grep + file) combined via Reciprocal Rank Fusion, deduplicated by session, with optional cross-encoder reranking via limbic
 - **daemon.py** — persistent indexer daemon: queue-based incremental indexing, message-count skip, startup full scan
-- **cli.py** — Click CLI exposing `init`, `index`, `search`, `show`, and `daemon` commands
+- **cli.py** — Click CLI exposing `init`, `index`, `search`, `show`, `recover`, `reembed`, `summarize`, `cross`, and `daemon` commands

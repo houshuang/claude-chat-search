@@ -34,24 +34,6 @@ def iter_jsonl_files() -> list[dict]:
                 "mtime": mtime,
             })
 
-        # Walk subagent directories
-        for session_dir in sorted(project_dir.iterdir()):
-            if not session_dir.is_dir():
-                continue
-            subagents_dir = session_dir / "subagents"
-            if not subagents_dir.exists():
-                continue
-            parent_session_id = session_dir.name
-            for jsonl_file in sorted(subagents_dir.glob("*.jsonl")):
-                mtime = os.path.getmtime(jsonl_file)
-                results.append({
-                    "path": jsonl_file,
-                    "project_path": project_path,
-                    "session_id": jsonl_file.stem,
-                    "parent_session_id": parent_session_id,
-                    "mtime": mtime,
-                })
-
     return results
 
 
@@ -246,6 +228,10 @@ def file_info_from_path(transcript_path: str | Path) -> dict | None:
     """
     path = Path(transcript_path)
     if not path.exists() or path.suffix != ".jsonl":
+        return None
+
+    # Skip subagent transcripts — their results flow into the main session
+    if "/subagents/" in str(path):
         return None
 
     try:

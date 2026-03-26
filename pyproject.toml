@@ -6,7 +6,7 @@ requires-python = ">=3.11"
 dependencies = [
     "apsw>=3.45",
     "click>=8.0",
-    "openai>=1.0",
+    "limbic @ git+https://github.com/houshuang/limbic.git",
     "sqlite-vec>=0.1.6",
     "tiktoken>=0.7",
 ]

@@ -4,8 +4,9 @@ from .parser import extract_text_content, extract_tool_summary, group_assistant_
 
 _encoder = None
 
-MAX_CHUNK_TOKENS = 800
-MIN_CHUNK_TOKENS = 30
+MAX_CHUNK_TOKENS = 600
+MIN_CHUNK_TOKENS = 150
+MERGE_TARGET_TOKENS = 200
 OVERLAP_RATIO = 0.25
 
 
@@ -80,6 +81,10 @@ def _collect_turns(messages: list[dict]) -> list[dict]:
             tool_summary = "\n".join(tool_summaries) if tool_summaries else ""
 
             if user_text.strip() or assistant_text.strip() or tool_summary:
+                # Skip noise: no user content and assistant is trivially short
+                if not user_text.strip() and len(assistant_text) < 100:
+                    i = j
+                    continue
                 turns.append({
                     "user_text": user_text.strip(),
                     "assistant_text": assistant_text.strip(),
@@ -101,6 +106,17 @@ def _build_combined(user_text: str, assistant_text: str, tool_summary: str) -> s
     return combined
 
 
+_TEMPLATE_PREFIXES = (
+    "Your task is to create a detailed summary",
+)
+
+
+def _is_prompt_template(text: str) -> bool:
+    """Detect compact/system prompt templates that add noise to search."""
+    stripped = text.strip()
+    return any(stripped.startswith(p) for p in _TEMPLATE_PREFIXES) if stripped else False
+
+
 def create_chunks(session_data: dict) -> list[dict]:
     """Create searchable chunks from parsed session data.
 
@@ -117,6 +133,8 @@ def create_chunks(session_data: dict) -> list[dict]:
     # Second pass: create chunks (splitting oversized ones)
     chunks = []
     for turn_num, turn in enumerate(merged_turns):
+        if _is_prompt_template(turn["user_text"]):
+            continue
         combined = _build_combined(turn["user_text"], turn["assistant_text"], turn["tool_summary"])
         token_count = count_tokens(combined)
 
@@ -163,11 +181,11 @@ def create_chunks(session_data: dict) -> list[dict]:
 
 
 def _merge_tiny_turns(turns: list[dict]) -> list[dict]:
-    """Merge consecutive tiny turns into multi-turn chunks.
+    """Merge consecutive small turns into multi-turn chunks.
 
-    Turns under MIN_CHUNK_TOKENS are merged with adjacent turns until
-    hitting MAX_CHUNK_TOKENS. This preserves context across tool-heavy
-    sequences where individual turns have very little text.
+    Turns under MERGE_TARGET_TOKENS are merged with adjacent turns until
+    hitting MAX_CHUNK_TOKENS. This ensures most chunks reach the 200-500
+    token sweet spot for embedding quality.
     """
     if not turns:
         return []
@@ -180,8 +198,8 @@ def _merge_tiny_turns(turns: list[dict]) -> list[dict]:
         tokens = count_tokens(combined)
 
         if pending is None:
-            if tokens < MIN_CHUNK_TOKENS:
-                # Start accumulating
+            if tokens < MERGE_TARGET_TOKENS:
+                # Start accumulating — too small for good embeddings
                 pending = {
                     "user_text": turn["user_text"],
                     "assistant_text": turn["assistant_text"],
@@ -194,7 +212,7 @@ def _merge_tiny_turns(turns: list[dict]) -> list[dict]:
                 turn["turn_number"] = i
                 merged.append(turn)
         else:
-            # We have a pending tiny turn — try to merge
+            # We have a pending small turn — try to merge
             merged_user = pending["user_text"]
             if turn["user_text"].strip():
                 merged_user += ("\n---\n" + turn["user_text"]) if merged_user.strip() else turn["user_text"]
@@ -216,14 +234,14 @@ def _merge_tiny_turns(turns: list[dict]) -> list[dict]:
                 pending["assistant_text"] = merged_asst
                 pending["tool_summary"] = merged_tools
                 pending["tokens"] = test_tokens
-                # If merged result is now big enough, flush it
-                if test_tokens >= MIN_CHUNK_TOKENS:
+                # If merged result reached target size, flush it
+                if test_tokens >= MERGE_TARGET_TOKENS:
                     merged.append(pending)
                     pending = None
             else:
                 # Would exceed max — flush pending and start fresh
                 merged.append(pending)
-                if tokens < MIN_CHUNK_TOKENS:
+                if tokens < MERGE_TARGET_TOKENS:
                     pending = {
                         "user_text": turn["user_text"],
                         "assistant_text": turn["assistant_text"],
