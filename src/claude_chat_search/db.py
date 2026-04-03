@@ -221,6 +221,7 @@ def delete_session_data(conn: apsw.Connection, session_id: str) -> None:
     for (cid,) in rows:
         conn.execute("DELETE FROM vec_chunks WHERE chunk_id = ?", (cid,))
     conn.execute("DELETE FROM chunks WHERE session_id = ?", (session_id,))
+    conn.execute("DELETE FROM subagents WHERE parent_session_id = ?", (session_id,))
     conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
     from .vector_search import invalidate_cache
     invalidate_cache()
