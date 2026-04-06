@@ -65,6 +65,7 @@ def init_db(conn: apsw.Connection) -> None:
         ("parent_session_id", "TEXT"),
         ("topic_summary", "TEXT"),
         ("git_remote", "TEXT"),
+        ("cwd", "TEXT"),
     ]:
         try:
             conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} {col_type}")
@@ -150,8 +151,8 @@ def insert_session(conn: apsw.Connection, session: dict) -> None:
         """INSERT INTO sessions
            (session_id, project_path, slug, git_branch,
             first_message_at, last_message_at, message_count, indexed_at,
-            files_touched, tools_used, commands_run, parent_session_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            files_touched, tools_used, commands_run, parent_session_id, cwd)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(session_id) DO UPDATE SET
             project_path=excluded.project_path,
             slug=excluded.slug,
@@ -163,7 +164,8 @@ def insert_session(conn: apsw.Connection, session: dict) -> None:
             files_touched=excluded.files_touched,
             tools_used=excluded.tools_used,
             commands_run=excluded.commands_run,
-            parent_session_id=excluded.parent_session_id""",
+            parent_session_id=excluded.parent_session_id,
+            cwd=excluded.cwd""",
         (
             session["session_id"],
             session["project_path"],
@@ -177,6 +179,7 @@ def insert_session(conn: apsw.Connection, session: dict) -> None:
             session.get("tools_used"),
             session.get("commands_run"),
             session.get("parent_session_id"),
+            session.get("cwd"),
         ),
     )
 

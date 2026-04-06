@@ -680,6 +680,135 @@ def cross(query, limit, project, branch, since, before):
     conn.close()
 
 
+@cli.command()
+@click.argument("query")
+@click.option("--limit", "-n", default=10, help="Number of results to show")
+@click.option("--project", "-p", default=None, help="Filter by project path substring")
+@click.option("--branch", "-b", default=None, help="Filter by git branch name substring")
+@click.option("--since", default=None, help="Only results after date (YYYY-MM-DD, 3d, 2w, 1m)")
+@click.option("--before", default=None, help="Only results before date (YYYY-MM-DD, 3d, 2w, 1m)")
+@click.option("--fork", "do_fork", is_flag=True, help="Fork the session instead of resuming in-place")
+def resume(query, limit, project, branch, since, before, do_fork):
+    """Search for a session and resume it in Claude Code.
+
+    Runs a semantic search, shows matching sessions, and lets you pick
+    one to resume via `claude --resume`.
+    """
+    import os
+    import shutil
+
+    from .search import hybrid_search
+
+    conn = get_connection()
+    init_db(conn)
+
+    since_iso = _parse_date(since) if since else None
+    before_iso = _parse_date(before) if before else None
+
+    results = hybrid_search(conn, query, limit=limit * 3, project=project,
+                            branch=branch, since=since_iso, before=before_iso)
+
+    if not results:
+        click.echo("No results found.")
+        conn.close()
+        return
+
+    # Deduplicate by session_id, keeping highest-scoring chunk per session
+    seen = {}
+    for r in results:
+        sid = r["session_id"]
+        if sid not in seen or r["score"] > seen[sid]["score"]:
+            seen[sid] = r
+    unique = sorted(seen.values(), key=lambda x: x["score"], reverse=True)[:limit]
+
+    # Display pick list
+    for i, r in enumerate(unique, 1):
+        session = get_session(conn, r["session_id"])
+        slug = session["slug"] or ""
+        cwd = session.get("cwd") or ""
+        summary = get_topic_summary(conn, r["session_id"]) or ""
+        msg_count = session["message_count"]
+
+        time_ago = _format_time(session["last_message_at"])
+        duration = _format_duration(session["first_message_at"], session["last_message_at"])
+
+        click.echo(f"\n  {i}. [{r['session_id'][:8]}] {slug}")
+        meta_parts = []
+        if time_ago:
+            meta_parts.append(time_ago)
+        if duration:
+            meta_parts.append(duration)
+        meta_parts.append(f"{msg_count} msgs")
+        if session.get("git_branch"):
+            meta_parts.append(f"branch: {session['git_branch']}")
+        click.echo(f"     {' · '.join(meta_parts)}")
+        if cwd:
+            click.echo(f"     cwd: {cwd}")
+        elif session.get("project_path"):
+            click.echo(f"     project: {session['project_path']}")
+        if summary:
+            click.echo(f"     {summary}")
+        else:
+            # Show a snippet from the matching chunk
+            snippet = _truncate(r.get("user_content", ""), 120)
+            if snippet:
+                click.echo(f"     \"{snippet}\"")
+
+    click.echo()
+
+    # Prompt for selection
+    if len(unique) == 1:
+        choice = 1
+        click.echo(f"Only one match — selecting #{choice}")
+    else:
+        try:
+            raw = click.prompt("Pick a session to resume (number, or q to quit)", type=str)
+        except (click.Abort, EOFError):
+            conn.close()
+            return
+        if raw.strip().lower() in ("q", "quit", ""):
+            conn.close()
+            return
+        try:
+            choice = int(raw)
+        except ValueError:
+            click.echo(f"Invalid selection: {raw}")
+            conn.close()
+            return
+        if choice < 1 or choice > len(unique):
+            click.echo(f"Selection out of range (1-{len(unique)})")
+            conn.close()
+            return
+
+    selected = unique[choice - 1]
+    session = get_session(conn, selected["session_id"])
+    session_id = session["session_id"]
+    cwd = session.get("cwd")
+    conn.close()
+
+    # Find claude binary
+    claude_bin = shutil.which("claude")
+    if not claude_bin:
+        click.echo("Error: 'claude' not found in PATH")
+        return
+
+    # Build the command
+    args = ["claude", "--resume", session_id]
+    if do_fork:
+        args.append("--fork-session")
+
+    slug = session.get("slug") or session_id[:12]
+    action = "Forking" if do_fork else "Resuming"
+    click.echo(f"\n{action} session: {slug}")
+
+    # cd to the session's working directory if available
+    if cwd and os.path.isdir(cwd):
+        os.chdir(cwd)
+        click.echo(f"Changed directory to: {cwd}")
+
+    os.execvp(claude_bin, args)
+
+
 @cli.group()
 def daemon():
     """Manage the indexer daemon."""

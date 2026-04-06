@@ -88,6 +88,7 @@ def parse_jsonl_file(filepath: Path) -> dict:
         "session_id": session_id or filepath.stem,
         "slug": slug,
         "git_branch": git_branch,
+        "cwd": cwd,
         "messages": messages,
         "first_message_at": min(timestamps) if timestamps else None,
         "last_message_at": max(timestamps) if timestamps else None,
