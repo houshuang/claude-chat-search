@@ -59,6 +59,20 @@ claude-chat-search show <session-id> --with-subagents
 
 Partial session ID matching is supported. Use `--turn` to highlight a specific turn. The header shows subagent count when > 0. Use `--with-subagents` to append subagent summaries.
 
+### Resume a past session
+
+```bash
+claude-chat-search resume "how we fixed the auth bug"
+claude-chat-search resume "database migration" --project myapp --since 1w
+claude-chat-search resume "refactoring plan" --fork
+```
+
+Searches for matching sessions, shows an interactive pick list, and resumes the selected session in Claude Code via `claude --resume`. Automatically `cd`s to the session's original working directory.
+
+Options:
+- Same filters as `search` (`-p`, `-b`, `--since`, `--before`, `-n`)
+- `--fork` — fork the session (creates a new session branching off the original)
+
 ### Explore subagent conversations
 
 Background agents (subagents) run during a session to handle parallel tasks. Their conversations are indexed as lightweight metadata and accessible on demand:
@@ -145,4 +159,4 @@ Then Claude Code will search your past conversations when you ask things like "r
 - **db.py** — SQLite with FTS5 for keyword search and `sqlite-vec` for vector storage
 - **search.py** — hybrid search (vector + keyword + grep + file) combined via Reciprocal Rank Fusion, deduplicated by session, with optional cross-encoder reranking via limbic
 - **daemon.py** — persistent indexer daemon: queue-based incremental indexing, message-count skip, startup full scan
-- **cli.py** — Click CLI exposing `init`, `index`, `search`, `show`, `subagents`, `subagent`, `recover`, `reembed`, `summarize`, `cross`, and `daemon` commands
+- **cli.py** — Click CLI exposing `init`, `index`, `search`, `resume`, `show`, `subagents`, `subagent`, `recover`, `reembed`, `summarize`, `cross`, and `daemon` commands
