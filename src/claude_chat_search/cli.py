@@ -155,7 +155,8 @@ def _log_search(query: str, mode: str, results: list[dict], latency_ms: float,
 @click.option("--grep", "grep_mode", is_flag=True, help="Exact substring search (no semantic/FTS5)")
 @click.option("--file", "file_mode", is_flag=True, help="Search by file path in session metadata")
 @click.option("--rerank", "do_rerank", is_flag=True, help="Re-score with cross-encoder (slower, more accurate)")
-def search(query, limit, project, branch, since, before, grep_mode, file_mode, do_rerank):
+@click.option("--expand", "do_expand", is_flag=True, help="LLM query expansion for better recall (~3-5s extra)")
+def search(query, limit, project, branch, since, before, grep_mode, file_mode, do_rerank, do_expand):
     """Search past conversations."""
     from .search import file_search, grep_search, hybrid_search
 
@@ -177,7 +178,7 @@ def search(query, limit, project, branch, since, before, grep_mode, file_mode, d
     else:
         results = hybrid_search(conn, query, limit=limit, project=project,
                                 branch=branch, since=since_iso, before=before_iso,
-                                do_rerank=do_rerank)
+                                do_rerank=do_rerank, expand=do_expand)
 
     filters = {}
     if project:

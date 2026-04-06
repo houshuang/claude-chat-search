@@ -5,8 +5,8 @@ Semantic search over your past Claude Code conversations. Indexes the JSONL conv
 ## Install
 
 ```bash
-git clone https://github.com/houshuang/claude-tool.git
-cd claude-tool/claude-chat-search
+git clone https://github.com/houshuang/claude-chat-search.git
+cd claude-chat-search
 uv venv && uv pip install -e .
 ```
 

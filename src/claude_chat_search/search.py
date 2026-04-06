@@ -1,3 +1,5 @@
+from limbic.amygdala import EmbeddingModel, expand_query, multi_list_rrf
+
 from .db import (
     file_search as db_file_search,
     fts_search,
@@ -5,7 +7,7 @@ from .db import (
     get_project_paths_for_remote,
     text_search,
 )
-from .embedder import embed_query
+from .embedder import embed_query, _get_model
 from .vector_search import numpy_vector_search
 
 RRF_K = 60
@@ -102,10 +104,16 @@ def hybrid_search(
     since: str | None = None,
     before: str | None = None,
     do_rerank: bool = False,
+    expand: bool = False,
 ) -> list[dict]:
     """Run hybrid semantic + keyword search with RRF merging.
 
     Deduplicates by session — returns the best-matching chunk per session.
+
+    When expand=True, uses LLM query expansion (lex/vec/hyde variants) to
+    generate additional sub-queries and fuses results across all of them
+    using multi-list RRF with top-rank bonuses. Adds ~3-5s latency but
+    typically 3-5x score improvement.
     """
     allowed_sessions = _build_session_filter(conn, project, branch, since, before)
 
@@ -115,7 +123,10 @@ def hybrid_search(
     vec_results = numpy_vector_search(conn, query_embedding, limit=fetch_limit)
     fts_results = fts_search(conn, query, limit=fetch_limit)
 
-    fused = reciprocal_rank_fusion([vec_results, fts_results])
+    if expand:
+        fused = _expanded_search(conn, query, vec_results, fts_results, fetch_limit)
+    else:
+        fused = reciprocal_rank_fusion([vec_results, fts_results])
 
     top_ids = [cid for cid, _ in fused[:fetch_limit * 2]]
     chunks = get_chunks_by_ids(conn, top_ids)
@@ -174,6 +185,30 @@ def hybrid_search(
             results.append(orig)
 
     return results
+
+
+def _expanded_search(conn, query, vec_results, fts_results, fetch_limit):
+    """Run LLM query expansion and fuse all results with multi-list RRF."""
+    model = _get_model()
+    expanded = expand_query(query)
+
+    ranked_lists = [vec_results, fts_results]
+    labels = ["vec:original", "fts:original"]
+
+    for eq in expanded:
+        if eq.type == "lex":
+            ranked_lists.append(fts_search(conn, eq.query, limit=fetch_limit))
+            labels.append(f"fts:{eq.query[:30]}")
+        elif eq.type in ("vec", "hyde"):
+            emb = model.embed(eq.query).tolist()
+            ranked_lists.append(numpy_vector_search(conn, emb, limit=fetch_limit))
+            labels.append(f"vec:{eq.type}:{eq.query[:25]}")
+
+    traced = multi_list_rrf(
+        ranked_lists, labels, k=RRF_K,
+        id_fn=lambda item: item["chunk_id"],
+    )
+    return [(r.id, r.score) for r in traced]
 
 
 def grep_search(
