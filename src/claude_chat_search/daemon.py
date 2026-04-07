@@ -1,9 +1,11 @@
 import logging
 import os
 import signal
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 from .chunker import create_chunks
 from .db import (
@@ -38,7 +40,11 @@ COOLDOWN_SECONDS = 60
 ACTIVE_COOLDOWN_SECONDS = 300  # 5 min for sessions that keep changing
 EMBED_INTERVAL = 30
 WAL_CHECKPOINT_INTERVAL = 600  # 10 minutes
+CODE_CHECK_INTERVAL = 300  # 5 min — exit if source code changed (launchd restarts)
+LOG_MAX_BYTES = 1_000_000  # 1MB — truncate daemon.log on startup if larger
+LOG_KEEP_LINES = 1000
 REINDEX_WINDOW = 600  # 10 min window for counting re-indexes
+REPO_DIR = Path(__file__).resolve().parent.parent.parent  # project root
 
 logger = logging.getLogger("claude-chat-search-daemon")
 
@@ -256,9 +262,33 @@ def is_running() -> int | None:
         return None
 
 
+def _get_git_commit() -> str | None:
+    """Return current HEAD commit hash, or None if not in a git repo."""
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=REPO_DIR, stderr=subprocess.DEVNULL, text=True,
+        ).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+
+def _truncate_log_if_needed():
+    """Truncate daemon.log on startup if it exceeds LOG_MAX_BYTES, keeping tail."""
+    if not LOG_FILE.exists():
+        return
+    if LOG_FILE.stat().st_size <= LOG_MAX_BYTES:
+        return
+    lines = LOG_FILE.read_text().splitlines()
+    kept = lines[-LOG_KEEP_LINES:]
+    LOG_FILE.write_text("\n".join(kept) + "\n")
+
+
 def run():
     """Main daemon loop (foreground). Suitable for launchd or direct invocation."""
     global _shutdown
+
+    _truncate_log_if_needed()
 
     logging.basicConfig(
         filename=str(LOG_FILE),
@@ -286,7 +316,9 @@ def run():
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
-    logger.info("Daemon started (PID %d)", os.getpid())
+    startup_commit = _get_git_commit()
+    logger.info("Daemon started (PID %d, commit %s)", os.getpid(),
+                startup_commit[:8] if startup_commit else "unknown")
 
     conn = get_connection()
     init_db(conn)
@@ -301,6 +333,7 @@ def run():
 
     last_embed_time = time.monotonic()
     last_wal_checkpoint = time.monotonic()
+    last_code_check = time.monotonic()
 
     while not _shutdown:
         try:
@@ -324,6 +357,15 @@ def run():
         if now - last_wal_checkpoint >= WAL_CHECKPOINT_INTERVAL:
             wal_checkpoint(conn)
             last_wal_checkpoint = time.monotonic()
+
+        # Exit if source code changed — launchd will restart with new code
+        if startup_commit and now - last_code_check >= CODE_CHECK_INTERVAL:
+            current = _get_git_commit()
+            if current and current != startup_commit:
+                logger.info("Code changed (%s -> %s), exiting for restart",
+                            startup_commit[:8], current[:8])
+                break
+            last_code_check = time.monotonic()
 
         for _ in range(POLL_INTERVAL * 10):
             if _shutdown:
