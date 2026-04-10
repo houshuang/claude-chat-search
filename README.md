@@ -49,6 +49,7 @@ Options:
 - `--grep` — exact substring search (skips semantic/FTS5, just matches raw text)
 - `--file` — search by file path mentioned in session tool calls
 - `--rerank` — re-score results with a cross-encoder for better relevance (slower, +5-15% accuracy)
+- `--expand` — LLM query expansion for better recall on vague/cross-vocabulary queries (~3-5s extra, typically 3-5x score improvement). Generates keyword variants, semantic rephrases, and hypothetical document excerpts to bridge vocabulary gaps.
 
 ### Inspect a session
 
@@ -157,6 +158,6 @@ Then Claude Code will search your past conversations when you ask things like "r
 - **embedder.py** — generates embeddings via [limbic](https://github.com/houshuang/limbic)'s `EmbeddingModel` (`paraphrase-multilingual-MiniLM-L12-v2`, local, multilingual, 384-dim)
 - **vector_search.py** — in-memory numpy vector search using limbic's `VectorIndex` with module-level caching
 - **db.py** — SQLite with FTS5 for keyword search and `sqlite-vec` for vector storage
-- **search.py** — hybrid search (vector + keyword + grep + file) combined via Reciprocal Rank Fusion, deduplicated by session, with optional cross-encoder reranking via limbic
+- **search.py** — hybrid search (vector + keyword + grep + file) combined via Reciprocal Rank Fusion, deduplicated by session, with optional cross-encoder reranking and LLM query expansion (lex/vec/hyde variants) via limbic
 - **daemon.py** — persistent indexer daemon: queue-based incremental indexing, message-count skip, startup full scan
 - **cli.py** — Click CLI exposing `init`, `index`, `search`, `resume`, `show`, `subagents`, `subagent`, `recover`, `reembed`, `summarize`, `cross`, and `daemon` commands

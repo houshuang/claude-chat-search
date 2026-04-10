@@ -13,6 +13,7 @@ Semantic search over Claude Code conversations. Indexes JSONL conversation files
 - `vector_search.py` — NumPy-cached vector search (faster than sqlite-vec for large result sets).
 - `summarizer.py` — LLM-based topic summarization of sessions.
 - `cross_search.py` — Cross-index search across multiple chat indexes.
+- `search.py` also supports `expand=True` for LLM query expansion (lex/vec/hyde variants via limbic's `expand_query` + `multi_list_rrf`).
 
 ## DB Schema (index.db in ~/.claude-chat-search/)
 
