@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .db import fts_search, get_chunks_by_ids
 from .embedder import embed_query
-from .search import RRF_K, _build_session_filter, reciprocal_rank_fusion
+from .search import RRF_K, _build_session_filter, _expanded_search, reciprocal_rank_fusion
 from .vector_search import numpy_vector_search
 
 OTAK_VENV_PYTHON = "/Users/stian/src/otak/.venv-otak/bin/python3"
@@ -69,6 +69,7 @@ def cross_search(
     branch: str | None = None,
     since: str | None = None,
     before: str | None = None,
+    expand: bool = False,
 ) -> list[dict]:
     """Search both chat and research indices, merge with RRF.
 
@@ -79,13 +80,14 @@ def cross_search(
     fetch_limit = limit * 5
     query_embedding = embed_query(query)
 
-    # --- Chat search (vector + FTS) ---
+    # --- Chat search (vector + FTS, optionally with LLM expansion) ---
     vec_results = numpy_vector_search(conn, query_embedding, limit=fetch_limit)
     fts_results = fts_search(conn, query, limit=fetch_limit)
 
-    # Assign synthetic chunk_ids for RRF: chat results use real chunk_ids,
-    # research results use negative IDs to avoid collision
-    chat_fused = reciprocal_rank_fusion([vec_results, fts_results])
+    if expand:
+        chat_fused = _expanded_search(conn, query, vec_results, fts_results, fetch_limit)
+    else:
+        chat_fused = reciprocal_rank_fusion([vec_results, fts_results])
 
     top_ids = [cid for cid, _ in chat_fused[:fetch_limit * 2]]
     chunks = get_chunks_by_ids(conn, top_ids)

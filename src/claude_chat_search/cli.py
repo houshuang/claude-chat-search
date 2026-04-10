@@ -602,7 +602,8 @@ def summarize(summarize_all, limit):
 @click.option("--branch", "-b", default=None, help="Filter by git branch name substring")
 @click.option("--since", default=None, help="Only results after date (YYYY-MM-DD, 3d, 2w, 1m)")
 @click.option("--before", default=None, help="Only results before date (YYYY-MM-DD, 3d, 2w, 1m)")
-def cross(query, limit, project, branch, since, before):
+@click.option("--expand", "do_expand", is_flag=True, help="LLM query expansion for better recall (~3-5s extra)")
+def cross(query, limit, project, branch, since, before, do_expand):
     """Search both chat history and research index."""
     from .cross_search import cross_search
 
@@ -614,7 +615,8 @@ def cross(query, limit, project, branch, since, before):
 
     t0 = _time.monotonic()
     results = cross_search(conn, query, limit=limit, project=project,
-                           branch=branch, since=since_iso, before=before_iso)
+                           branch=branch, since=since_iso, before=before_iso,
+                           expand=do_expand)
     elapsed = (_time.monotonic() - t0) * 1000
 
     if not results:
