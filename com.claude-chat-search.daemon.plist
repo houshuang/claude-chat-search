@@ -6,8 +6,6 @@
     <string>com.claude-chat-search.daemon</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/arch</string>
-        <string>-x86_64</string>
         <string>/Users/stian/tana/claude-tool/claude-chat-search/.venv/bin/python</string>
         <string>-m</string>
         <string>claude_chat_search.cli</string>
