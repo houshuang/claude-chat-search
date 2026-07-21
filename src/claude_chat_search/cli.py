@@ -26,11 +26,13 @@ from .db import (
     update_session_git_remote,
 )
 from .parser import (
+    EXCLUDED_PROJECTS_PATH,
     detect_git_remote,
     extract_session_metadata,
     find_project_dir,
     iter_jsonl_files,
     iter_subagent_files,
+    load_excluded_projects,
     parse_jsonl_file,
     parse_subagent_conversation,
     parse_subagent_metadata,
@@ -809,6 +811,73 @@ def resume(query, limit, project, branch, since, before, do_fork):
         click.echo(f"Changed directory to: {cwd}")
 
     os.execvp(claude_bin, args)
+
+
+@cli.group()
+def exclude():
+    """Manage project paths excluded from indexing."""
+    pass
+
+
+def _purge_project(conn, project_path: str) -> int:
+    """Delete all indexed sessions (and their chunks/subagents) for a project
+    and any project nested under it."""
+    rows = _fetchall(
+        conn,
+        "SELECT session_id FROM sessions WHERE project_path = ? OR project_path LIKE ?",
+        (project_path, project_path + "/%"),
+    )
+    for row in rows:
+        delete_session_data(conn, row["session_id"])
+    return len(rows)
+
+
+@exclude.command("add")
+@click.argument("project_path")
+def exclude_add(project_path):
+    """Exclude a project path from indexing and purge its existing index data."""
+    project_path = project_path.rstrip("/")
+    excluded = load_excluded_projects()
+    if project_path in excluded:
+        click.echo(f"Already excluded: {project_path}")
+    else:
+        EXCLUDED_PROJECTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(EXCLUDED_PROJECTS_PATH, "a") as f:
+            f.write(project_path + "\n")
+        click.echo(f"Excluded: {project_path}")
+
+    conn = get_connection()
+    init_db(conn)
+    purged = _purge_project(conn, project_path)
+    conn.close()
+    click.echo(f"Purged {purged} indexed session(s) for {project_path}")
+
+
+@exclude.command("remove")
+@click.argument("project_path")
+def exclude_remove(project_path):
+    """Stop excluding a project path (it will be re-indexed on next scan)."""
+    project_path = project_path.rstrip("/")
+    excluded = load_excluded_projects()
+    if project_path not in excluded:
+        click.echo(f"Not excluded: {project_path}")
+        return
+    excluded.discard(project_path)
+    EXCLUDED_PROJECTS_PATH.write_text(
+        "".join(p + "\n" for p in sorted(excluded))
+    )
+    click.echo(f"Removed exclusion: {project_path} (will re-index on next daemon scan)")
+
+
+@exclude.command("list")
+def exclude_list():
+    """List excluded project paths."""
+    excluded = sorted(load_excluded_projects())
+    if not excluded:
+        click.echo("No excluded projects")
+        return
+    for p in excluded:
+        click.echo(p)
 
 
 @cli.group()
