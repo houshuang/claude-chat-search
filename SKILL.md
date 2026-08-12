@@ -1,11 +1,11 @@
 ---
-name: Claude Chat Search
-description: Search past Claude Code conversations using semantic search. Use this skill when users want to find previous conversations, recall what was discussed, search chat history, or look up past sessions by topic. Also supports cross-index search across chat history AND research files.
+name: Chat Search
+description: Search past Claude Code and Codex conversations using semantic search. Use this skill when users want to find previous conversations, recall what was discussed, search chat history, or look up past sessions by topic. Also supports cross-index search across chat history AND research files.
 ---
 
-# Claude Chat Search
+# Chat Search
 
-Search past Claude Code conversations using hybrid semantic + keyword search.
+Search past Claude Code and Codex conversations using hybrid semantic + keyword search.
 
 Source code: `~/tana/claude-tool/claude-chat-search/`
 Upstream repo: `tanainc/devtools` (path: `claude-chat-search/`)
@@ -16,7 +16,7 @@ Activate this skill when the user:
 - Wants to find a past Claude Code conversation by topic
 - Asks "remember when we..." or "that time we discussed..."
 - Needs to recall what was done in a previous session
-- Wants to search their Claude chat history
+- Wants to search their Claude or Codex chat history
 - Asks about work done on a specific project or branch
 - Wants to search across both chat history and research documents (use `cross`)
 
@@ -39,6 +39,7 @@ claude-chat-search search "QUERY" [OPTIONS]
 - `--grep`: Exact substring search (no semantic matching)
 - `--file`: Search by file path in session metadata
 - `--rerank`: Re-score with cross-encoder for better relevance (slower, more accurate)
+- `--source claude|codex|all`: Filter by conversation source (default: all)
 
 Search results include topic summaries (if generated) for quick context.
 
@@ -91,6 +92,8 @@ claude-chat-search index
 ```
 
 Run this to pick up conversations that happened since the last index. Only processes new/modified sessions.
+
+Use `claude-chat-search index --source codex` for the periodic Codex history scan.
 
 ## Tips
 

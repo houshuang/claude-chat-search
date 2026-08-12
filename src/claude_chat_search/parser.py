@@ -66,7 +66,11 @@ def iter_jsonl_files() -> list[dict]:
                 "path": jsonl_file,
                 "project_path": project_path,
                 "session_id": jsonl_file.stem,
+                "native_session_id": jsonl_file.stem,
+                "source": "claude",
+                "thread_kind": "user",
                 "mtime": mtime,
+                "size": os.path.getsize(jsonl_file),
             })
 
     return results
@@ -286,7 +290,11 @@ def file_info_from_path(transcript_path: str | Path) -> dict | None:
         "path": path,
         "project_path": project_path,
         "session_id": path.stem,
+        "native_session_id": path.stem,
+        "source": "claude",
+        "thread_kind": "user",
         "mtime": os.path.getmtime(path),
+        "size": os.path.getsize(path),
     }
 
     # Subagent: {project}/{parent_session_id}/subagents/{session_id}.jsonl
@@ -329,9 +337,14 @@ def _load_git_remote_cache() -> dict[str, str | None]:
 def _save_git_remote_cache() -> None:
     if _git_remote_cache is None:
         return
-    GIT_REMOTE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(GIT_REMOTE_CACHE_PATH, "w") as f:
-        json.dump(_git_remote_cache, f, indent=2)
+    try:
+        GIT_REMOTE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(GIT_REMOTE_CACHE_PATH, "w") as f:
+            json.dump(_git_remote_cache, f, indent=2)
+    except OSError:
+        # Read-only/sandboxed runs can still index; they simply do not persist
+        # this optional performance cache.
+        pass
 
 
 def detect_git_remote(project_path: str) -> str | None:
@@ -547,5 +560,5 @@ def group_assistant_messages(messages: list[dict]) -> list[dict]:
     for msg in assistant_by_request.values():
         grouped.append(msg)
 
-    grouped.sort(key=lambda m: m.get("timestamp", ""))
+    grouped.sort(key=lambda m: m.get("timestamp") or "")
     return grouped

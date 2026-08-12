@@ -3,6 +3,7 @@ import tiktoken
 from .parser import extract_text_content, extract_tool_summary, group_assistant_messages
 
 _encoder = None
+_encoder_unavailable = False
 
 MAX_CHUNK_TOKENS = 600
 MIN_CHUNK_TOKENS = 150
@@ -11,14 +12,23 @@ OVERLAP_RATIO = 0.25
 
 
 def get_encoder():
-    global _encoder
-    if _encoder is None:
-        _encoder = tiktoken.get_encoding("cl100k_base")
+    global _encoder, _encoder_unavailable
+    if _encoder is None and not _encoder_unavailable:
+        try:
+            _encoder = tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            # The tokenizer data may not be cached and scheduled index jobs are
+            # intentionally offline.  Chunk boundaries do not require exact
+            # billing-token counts, so use the deterministic estimate below.
+            _encoder_unavailable = True
     return _encoder
 
 
 def count_tokens(text: str) -> int:
-    return len(get_encoder().encode(text))
+    encoder = get_encoder()
+    if encoder is None:
+        return max(1, (len(text) + 3) // 4)
+    return len(encoder.encode(text))
 
 
 def split_text_at_paragraphs(text: str, max_tokens: int, overlap_ratio: float = OVERLAP_RATIO) -> list[str]:

@@ -1,11 +1,18 @@
+import os
 import struct
+from datetime import datetime, timezone
 from pathlib import Path
 
 import apsw
 import sqlite_vec
 
-DB_DIR = Path.home() / ".claude-chat-search"
-DB_PATH = DB_DIR / "index.db"
+_configured_db_path = os.environ.get("CHAT_SEARCH_DB_PATH")
+DB_PATH = (
+    Path(_configured_db_path).expanduser()
+    if _configured_db_path
+    else Path.home() / ".claude-chat-search" / "index.db"
+)
+DB_DIR = DB_PATH.parent
 EMBEDDING_DIM = 384
 
 
@@ -22,6 +29,26 @@ def get_connection() -> apsw.Connection:
     conn.execute("PRAGMA foreign_keys=ON")
     conn.setbusytimeout(5000)
     return conn
+
+
+def backup_database(conn: apsw.Connection, destination: Path | None = None) -> Path:
+    """Create a consistent online backup without mutating or stopping the source DB."""
+    if destination is None:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        destination = DB_DIR / "backups" / f"index-{stamp}.db"
+    destination = Path(destination).expanduser()
+    if destination.exists():
+        raise FileExistsError(f"Backup destination already exists: {destination}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    backup_conn = apsw.Connection(str(destination))
+    backup = backup_conn.backup("main", conn, "main")
+    try:
+        backup.step(-1)
+    finally:
+        backup.finish()
+        backup_conn.close()
+    return destination
 
 
 def _fetchall(conn: apsw.Connection, sql: str, bindings=None) -> list[dict]:
@@ -66,11 +93,30 @@ def init_db(conn: apsw.Connection) -> None:
         ("topic_summary", "TEXT"),
         ("git_remote", "TEXT"),
         ("cwd", "TEXT"),
+        ("source", "TEXT NOT NULL DEFAULT 'claude'"),
+        ("native_session_id", "TEXT"),
+        ("transcript_path", "TEXT"),
+        ("transcript_mtime", "REAL"),
+        ("transcript_size", "INTEGER"),
+        ("thread_kind", "TEXT NOT NULL DEFAULT 'user'"),
     ]:
         try:
             conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} {col_type}")
         except apsw.SQLError:
             pass  # column already exists
+
+    # Existing rows predate multi-source indexing and are all Claude sessions.
+    conn.execute("UPDATE sessions SET source = 'claude' WHERE source IS NULL OR source = ''")
+    conn.execute(
+        "UPDATE sessions SET native_session_id = session_id "
+        "WHERE native_session_id IS NULL OR native_session_id = ''"
+    )
+    conn.execute("UPDATE sessions SET thread_kind = 'user' WHERE thread_kind IS NULL")
+    conn.execute("CREATE INDEX IF NOT EXISTS sessions_source_idx ON sessions(source)")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS sessions_source_native_idx "
+        "ON sessions(source, native_session_id)"
+    )
 
     # Subagent metadata table (lightweight — no chunks, no embeddings)
     conn.execute("""
@@ -151,8 +197,10 @@ def insert_session(conn: apsw.Connection, session: dict) -> None:
         """INSERT INTO sessions
            (session_id, project_path, slug, git_branch,
             first_message_at, last_message_at, message_count, indexed_at,
-            files_touched, tools_used, commands_run, parent_session_id, cwd)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            files_touched, tools_used, commands_run, parent_session_id, cwd,
+            source, native_session_id, transcript_path, transcript_mtime,
+            transcript_size, thread_kind)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(session_id) DO UPDATE SET
             project_path=excluded.project_path,
             slug=excluded.slug,
@@ -165,7 +213,13 @@ def insert_session(conn: apsw.Connection, session: dict) -> None:
             tools_used=excluded.tools_used,
             commands_run=excluded.commands_run,
             parent_session_id=excluded.parent_session_id,
-            cwd=excluded.cwd""",
+            cwd=excluded.cwd,
+            source=excluded.source,
+            native_session_id=excluded.native_session_id,
+            transcript_path=excluded.transcript_path,
+            transcript_mtime=excluded.transcript_mtime,
+            transcript_size=excluded.transcript_size,
+            thread_kind=excluded.thread_kind""",
         (
             session["session_id"],
             session["project_path"],
@@ -180,6 +234,26 @@ def insert_session(conn: apsw.Connection, session: dict) -> None:
             session.get("commands_run"),
             session.get("parent_session_id"),
             session.get("cwd"),
+            session.get("source", "claude"),
+            session.get("native_session_id", session["session_id"]),
+            session.get("transcript_path"),
+            session.get("transcript_mtime"),
+            session.get("transcript_size"),
+            session.get("thread_kind", "user"),
+        ),
+    )
+
+
+def update_session_fingerprint(conn: apsw.Connection, session_id: str, file_info: dict) -> None:
+    conn.execute(
+        """UPDATE sessions
+           SET transcript_path = ?, transcript_mtime = ?, transcript_size = ?
+           WHERE session_id = ?""",
+        (
+            str(file_info["path"]),
+            file_info.get("mtime"),
+            file_info.get("size"),
+            session_id,
         ),
     )
 
@@ -279,37 +353,50 @@ def fts_search(conn: apsw.Connection, query: str, limit: int = 20) -> list[dict]
     return [{"chunk_id": r[0], "rank": r[1]} for r in rows]
 
 
-def text_search(conn: apsw.Connection, query: str, limit: int = 50) -> list[dict]:
+def text_search(
+    conn: apsw.Connection, query: str, limit: int = 50,
+    source: str | None = None,
+) -> list[dict]:
     """Exact substring search via SQL LIKE. No FTS5, no embeddings."""
     if not query.strip():
         return []
+    source_clause = " AND s.source = ?" if source else ""
+    bindings = (query, source, limit) if source else (query, limit)
     return _fetchall(
         conn,
-        """SELECT c.*, s.project_path, s.slug, s.git_branch,
-                  s.message_count, s.first_message_at, s.last_message_at
+        f"""SELECT c.*, s.project_path, s.slug, s.git_branch,
+                  s.message_count, s.first_message_at, s.last_message_at,
+                  s.source, s.native_session_id, s.thread_kind
            FROM chunks c
            JOIN sessions s ON c.session_id = s.session_id
            WHERE c.combined_text LIKE '%' || ? || '%'
+           {source_clause}
            ORDER BY c.id DESC
            LIMIT ?""",
-        (query, limit),
+        bindings,
     )
 
 
-def file_search(conn: apsw.Connection, query: str, limit: int = 20) -> list[dict]:
+def file_search(
+    conn: apsw.Connection, query: str, limit: int = 20,
+    source: str | None = None,
+) -> list[dict]:
     """Search sessions by file path in files_touched metadata."""
     if not query.strip():
         return []
+    source_clause = " AND s.source = ?" if source else ""
+    bindings = (query, source, limit) if source else (query, limit)
     return _fetchall(
         conn,
-        """SELECT s.*, NULL as id, NULL as user_content, NULL as assistant_content,
+        f"""SELECT s.*, NULL as id, NULL as user_content, NULL as assistant_content,
                   NULL as combined_text, s.first_message_at as timestamp,
                   0 as turn_number, 0 as token_estimate
            FROM sessions s
            WHERE s.files_touched LIKE '%' || ? || '%'
+           {source_clause}
            ORDER BY s.last_message_at DESC
            LIMIT ?""",
-        (query, limit),
+        bindings,
     )
 
 
@@ -320,7 +407,8 @@ def get_chunks_by_ids(conn: apsw.Connection, chunk_ids: list[int]) -> list[dict]
     return _fetchall(
         conn,
         f"""SELECT c.*, s.project_path, s.slug, s.git_branch,
-                   s.message_count, s.first_message_at, s.last_message_at
+                   s.message_count, s.first_message_at, s.last_message_at,
+                   s.source, s.native_session_id, s.thread_kind
             FROM chunks c
             JOIN sessions s ON c.session_id = s.session_id
             WHERE c.id IN ({placeholders})""",
@@ -340,9 +428,23 @@ def get_session_chunks(conn: apsw.Connection, session_id: str) -> list[dict]:
     )
 
 
-def get_indexed_sessions(conn: apsw.Connection) -> dict[str, str]:
-    rows = list(conn.execute("SELECT session_id, indexed_at FROM sessions"))
-    return {r[0]: r[1] for r in rows}
+def get_indexed_sessions(conn: apsw.Connection, source: str | None = None) -> dict[str, dict]:
+    sql = (
+        "SELECT session_id, indexed_at, transcript_path, transcript_mtime, "
+        "transcript_size FROM sessions"
+    )
+    bindings = ()
+    if source:
+        sql += " WHERE source = ?"
+        bindings = (source,)
+    rows = _fetchall(conn, sql, bindings)
+    return {row["session_id"]: row for row in rows}
+
+
+def get_session_ids_by_source(conn: apsw.Connection, source: str) -> list[str]:
+    return [row[0] for row in conn.execute(
+        "SELECT session_id FROM sessions WHERE source = ?", (source,)
+    )]
 
 
 def get_stats(conn: apsw.Connection) -> dict:

@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.claude-chat-search.codex-index</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/stian/tana/claude-tool/claude-chat-search/.venv/bin/python</string>
+        <string>-m</string>
+        <string>claude_chat_search.cli</string>
+        <string>index</string>
+        <string>--source</string>
+        <string>codex</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>10800</integer>
+    <key>Nice</key>
+    <integer>15</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HF_HUB_OFFLINE</key>
+        <string>1</string>
+        <key>TRANSFORMERS_OFFLINE</key>
+        <string>1</string>
+        <key>OMP_NUM_THREADS</key>
+        <string>2</string>
+        <key>MKL_NUM_THREADS</key>
+        <string>2</string>
+        <key>VECLIB_MAXIMUM_THREADS</key>
+        <string>2</string>
+        <key>TOKENIZERS_PARALLELISM</key>
+        <string>false</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/Users/stian/.claude-chat-search/codex-index-stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/stian/.claude-chat-search/codex-index-stderr.log</string>
+</dict>
+</plist>

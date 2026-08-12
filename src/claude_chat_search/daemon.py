@@ -7,6 +7,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import apsw
+
 from .chunker import create_chunks
 from .db import (
     DB_DIR,
@@ -18,6 +20,7 @@ from .db import (
     insert_chunks,
     insert_session,
     insert_subagent,
+    update_session_fingerprint,
     update_session_git_remote,
 )
 from .parser import (
@@ -36,6 +39,7 @@ QUEUE_PROCESSING = DB_DIR / ".queue.processing"
 PID_FILE = DB_DIR / "daemon.pid"
 LOG_FILE = DB_DIR / "daemon.log"
 POLL_INTERVAL = 2
+BUSY_RETRY_SECONDS = 30
 COOLDOWN_SECONDS = 60
 ACTIVE_COOLDOWN_SECONDS = 300  # 5 min for sessions that keep changing
 EMBED_INTERVAL = 30
@@ -74,6 +78,17 @@ def index_single_session(conn, file_info: dict) -> bool:
     if current_fp == _file_fingerprints.get(sid):
         return False
 
+    existing = get_session(conn, sid)
+    if (
+        existing
+        and existing.get("transcript_mtime") == current_fp[0]
+        and existing.get("transcript_size") == current_fp[1]
+    ):
+        _file_fingerprints[sid] = current_fp
+        if existing.get("transcript_path") != str(path):
+            update_session_fingerprint(conn, sid, file_info)
+        return False
+
     try:
         session_data = parse_jsonl_file(path)
     except Exception as e:
@@ -83,27 +98,33 @@ def index_single_session(conn, file_info: dict) -> bool:
     if not session_data["messages"]:
         return False
 
-    existing = get_session(conn, sid)
     if existing and existing["message_count"] == session_data["message_count"]:
         # File changed but message_count didn't — update fingerprint, skip re-index
+        update_session_fingerprint(conn, sid, file_info)
         _file_fingerprints[sid] = current_fp
         return False
-
-    if existing:
-        delete_session_data(conn, sid)
 
     now = datetime.now(timezone.utc).isoformat()
     session_data["project_path"] = file_info["project_path"]
     session_data["indexed_at"] = now
     session_data["parent_session_id"] = file_info.get("parent_session_id")
+    session_data["source"] = file_info.get("source", "claude")
+    session_data["native_session_id"] = file_info.get("native_session_id", sid)
+    session_data["thread_kind"] = file_info.get("thread_kind", "user")
+    session_data["transcript_path"] = str(path)
+    session_data["transcript_mtime"] = current_fp[0]
+    session_data["transcript_size"] = current_fp[1]
 
     metadata = extract_session_metadata(session_data["messages"])
     session_data.update(metadata)
-
-    insert_session(conn, session_data)
     chunks = create_chunks(session_data)
-    if chunks:
-        insert_chunks(conn, chunks)
+
+    with conn:
+        if existing:
+            delete_session_data(conn, sid)
+        insert_session(conn, session_data)
+        if chunks:
+            insert_chunks(conn, chunks)
 
     # Backfill git remote for this session's project
     project_path = file_info["project_path"]
@@ -326,10 +347,25 @@ def run():
     # Startup catch-up
     if not _shutdown:
         logger.info("Running startup full scan...")
-        count = full_scan(conn)
-        logger.info(f"Startup scan: indexed {count} sessions")
-        if count > 0:
-            run_embeddings(conn)
+        while not _shutdown:
+            try:
+                count = full_scan(conn)
+                logger.info(f"Startup scan: indexed {count} sessions")
+                if count > 0:
+                    run_embeddings(conn)
+                break
+            except apsw.BusyError:
+                # Another explicit index/backup job can briefly hold the writer
+                # lock.  Wait at low CPU and retry instead of crash-looping under
+                # launchd KeepAlive.
+                logger.warning(
+                    "Startup scan deferred: database is busy; retrying in %ss",
+                    BUSY_RETRY_SECONDS,
+                )
+                for _ in range(BUSY_RETRY_SECONDS * 10):
+                    if _shutdown:
+                        break
+                    time.sleep(0.1)
 
     last_embed_time = time.monotonic()
     last_wal_checkpoint = time.monotonic()
