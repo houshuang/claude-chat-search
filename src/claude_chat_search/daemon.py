@@ -239,23 +239,28 @@ def full_scan(conn) -> int:
 
 def run_embeddings(conn):
     """Run embedding pipeline in batches, checking shutdown between batches."""
-    from .embedder import embed_texts
+    from .embedder import embed_texts, embedding_lock
     from .db import insert_embeddings
 
-    while not _shutdown:
-        rows = get_unembedded_chunks(conn, 256)
-        if not rows:
-            break
+    with embedding_lock() as acquired:
+        if not acquired:
+            logger.info("Embedding pass skipped: another indexer holds the lock")
+            return
 
-        texts = [r["combined_text"] for r in rows]
-        chunk_ids = [r["id"] for r in rows]
+        while not _shutdown:
+            rows = get_unembedded_chunks(conn, 256)
+            if not rows:
+                break
 
-        try:
-            embeddings = embed_texts(texts)
-            insert_embeddings(conn, chunk_ids, embeddings)
-        except Exception:
-            logger.exception("Embedding batch failed")
-            break
+            texts = [r["combined_text"] for r in rows]
+            chunk_ids = [r["id"] for r in rows]
+
+            try:
+                embeddings = embed_texts(texts)
+                insert_embeddings(conn, chunk_ids, embeddings)
+            except Exception:
+                logger.exception("Embedding batch failed")
+                break
 
 
 def wal_checkpoint(conn):

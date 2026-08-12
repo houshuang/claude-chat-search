@@ -7,6 +7,7 @@ from unittest.mock import patch
 from claude_chat_search import db
 from claude_chat_search.cli import _run_index
 from claude_chat_search.codex_parser import iter_codex_jsonl_files
+from claude_chat_search.embedder import embedding_lock
 
 from test_codex_parser import SESSION_ID, session_meta, write_jsonl
 
@@ -60,6 +61,12 @@ class MultiSourceDatabaseTests(unittest.TestCase):
         finally:
             db.DB_PATH, db.DB_DIR = original_path, original_dir
         self.assertEqual(row["source"], "claude")
+
+    def test_embedding_lock_allows_only_one_indexer(self):
+        with embedding_lock() as first:
+            self.assertTrue(first)
+            with embedding_lock() as second:
+                self.assertFalse(second)
 
     def test_codex_index_is_incremental_and_namespaced(self):
         rollout = Path(self.tmp.name) / f"rollout-{SESSION_ID}.jsonl"

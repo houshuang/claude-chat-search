@@ -283,10 +283,21 @@ def insert_chunks(conn: apsw.Connection, chunks: list[dict]) -> list[int]:
 
 def insert_embeddings(conn: apsw.Connection, chunk_ids: list[int], embeddings: list[list[float]]) -> None:
     for chunk_id, emb in zip(chunk_ids, embeddings):
-        conn.execute(
-            "INSERT OR REPLACE INTO vec_chunks (chunk_id, embedding) VALUES (?, ?)",
-            (chunk_id, serialize_embedding(emb)),
-        )
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO vec_chunks (chunk_id, embedding) VALUES (?, ?)",
+                (chunk_id, serialize_embedding(emb)),
+            )
+        except apsw.SQLError as error:
+            # sqlite-vec can surface a primary-key race as SQLError even for
+            # INSERT OR REPLACE.  If another indexer completed this exact chunk,
+            # accept its vector; otherwise preserve the real failure.
+            duplicate = "UNIQUE constraint failed on vec_chunks primary key" in str(error)
+            exists = duplicate and conn.execute(
+                "SELECT 1 FROM vec_chunks WHERE chunk_id = ?", (chunk_id,)
+            ).fetchone()
+            if not exists:
+                raise
         conn.execute("UPDATE chunks SET embedded = 1 WHERE id = ?", (chunk_id,))
     # Invalidate numpy search cache so it picks up new embeddings
     from .vector_search import invalidate_cache
