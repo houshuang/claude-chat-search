@@ -7,8 +7,7 @@ description: Search past Claude Code conversations using semantic search. Use th
 
 Search past Claude Code conversations using hybrid semantic + keyword search.
 
-Source code: `~/tana/claude-tool/claude-chat-search/`
-Upstream repo: `tanainc/devtools` (path: `claude-chat-search/`)
+Source code: https://github.com/houshuang/claude-chat-search
 
 ## When to Use This Skill
 
