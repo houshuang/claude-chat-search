@@ -56,13 +56,14 @@ def _build_session_filter(
     branch: str | None = None,
     since: str | None = None,
     before: str | None = None,
+    source: str | None = None,
 ) -> set[str] | None:
     """Pre-filter session IDs by metadata. Returns None if no filters active.
 
     The project filter auto-expands across multiple checkouts of the same repo
     by looking up the git_remote column.
     """
-    if not any([project, branch, since, before]):
+    if not any([project, branch, since, before, source]):
         return None
 
     conditions = []
@@ -87,6 +88,9 @@ def _build_session_filter(
     if before:
         conditions.append("first_message_at <= ?")
         params.append(before)
+    if source:
+        conditions.append("source = ?")
+        params.append(source)
 
     where = " AND ".join(conditions)
     rows = list(conn.execute(
@@ -105,6 +109,7 @@ def hybrid_search(
     before: str | None = None,
     do_rerank: bool = False,
     expand: bool = False,
+    source: str | None = None,
 ) -> list[dict]:
     """Run hybrid semantic + keyword search with RRF merging.
 
@@ -115,9 +120,11 @@ def hybrid_search(
     using multi-list RRF with top-rank bonuses. Adds ~3-5s latency but
     typically 3-5x score improvement.
     """
-    allowed_sessions = _build_session_filter(conn, project, branch, since, before)
+    allowed_sessions = _build_session_filter(
+        conn, project, branch, since, before, source
+    )
 
-    fetch_limit = limit * 5
+    fetch_limit = limit * (50 if allowed_sessions is not None else 5)
 
     query_embedding = embed_query(query)
     vec_results = numpy_vector_search(conn, query_embedding, limit=fetch_limit)
@@ -149,6 +156,8 @@ def hybrid_search(
             "chunk_id": cid,
             "score": score,
             "session_id": sid,
+            "source": chunk.get("source", "claude"),
+            "native_session_id": chunk.get("native_session_id", sid),
             "project_path": chunk["project_path"],
             "slug": chunk["slug"],
             "git_branch": chunk["git_branch"],
@@ -219,15 +228,18 @@ def grep_search(
     branch: str | None = None,
     since: str | None = None,
     before: str | None = None,
+    source: str | None = None,
 ) -> list[dict]:
     """Exact substring search across chunk text.
 
     Useful for file paths, branch names, error messages, and other exact strings
     that don't work well with FTS5 or semantic search.
     """
-    allowed_sessions = _build_session_filter(conn, project, branch, since, before)
+    allowed_sessions = _build_session_filter(
+        conn, project, branch, since, before, source
+    )
 
-    results = text_search(conn, query, limit=limit * 5)
+    results = text_search(conn, query, limit=limit * 5, source=source)
 
     seen_sessions: dict[str, dict] = {}
     for r in results:
@@ -241,6 +253,8 @@ def grep_search(
             "chunk_id": r["id"],
             "score": 1.0,
             "session_id": sid,
+            "source": r.get("source", "claude"),
+            "native_session_id": r.get("native_session_id", sid),
             "project_path": r["project_path"],
             "slug": r["slug"],
             "git_branch": r["git_branch"],
@@ -266,14 +280,17 @@ def file_search(
     branch: str | None = None,
     since: str | None = None,
     before: str | None = None,
+    source: str | None = None,
 ) -> list[dict]:
     """Search sessions by file path in metadata.
 
     Uses the files_touched JSON field stored on sessions during indexing.
     """
-    allowed_sessions = _build_session_filter(conn, project, branch, since, before)
+    allowed_sessions = _build_session_filter(
+        conn, project, branch, since, before, source
+    )
 
-    results = db_file_search(conn, query, limit=limit * 3)
+    results = db_file_search(conn, query, limit=limit * 3, source=source)
 
     seen_sessions: dict[str, dict] = {}
     for r in results:
@@ -287,6 +304,8 @@ def file_search(
             "chunk_id": 0,
             "score": 1.0,
             "session_id": sid,
+            "source": r.get("source", "claude"),
+            "native_session_id": r.get("native_session_id", sid),
             "project_path": r["project_path"],
             "slug": r["slug"],
             "git_branch": r["git_branch"],

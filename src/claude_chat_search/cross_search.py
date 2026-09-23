@@ -109,7 +109,9 @@ def cross_search(
         chat_results.append({
             "score": score,
             "source": "chat",
+            "chat_source": chunk.get("source", "claude"),
             "session_id": sid,
+            "native_session_id": chunk.get("native_session_id", sid),
             "project_path": chunk["project_path"],
             "slug": chunk["slug"],
             "git_branch": chunk["git_branch"],

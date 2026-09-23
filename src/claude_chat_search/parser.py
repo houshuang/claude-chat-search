@@ -7,12 +7,39 @@ from pathlib import Path
 
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 GIT_REMOTE_CACHE_PATH = Path.home() / ".claude-chat-search" / "git-remotes.json"
+EXCLUDED_PROJECTS_PATH = Path.home() / ".claude-chat-search" / "excluded_projects.txt"
 
 _git_remote_cache: dict[str, str | None] | None = None
 
 
 def decode_project_path(dirname: str) -> str:
     return dirname.replace("-", "/", 1).replace("-", "/")
+
+
+def load_excluded_projects() -> set[str]:
+    """Load the set of project paths that must never be indexed.
+
+    One decoded project path per line (e.g. /Users/stian); blank lines and
+    #-comments are ignored. Read fresh on each call so the daemon picks up
+    changes without a restart.
+    """
+    try:
+        lines = EXCLUDED_PROJECTS_PATH.read_text().splitlines()
+    except OSError:
+        return set()
+    return {
+        line.strip().rstrip("/")
+        for line in lines
+        if line.strip() and not line.strip().startswith("#")
+    }
+
+
+def is_excluded_project(project_path: str, excluded: set[str] | None = None) -> bool:
+    """True if project_path is an excluded path or lives under one."""
+    if excluded is None:
+        excluded = load_excluded_projects()
+    path = project_path.rstrip("/")
+    return any(path == ex or path.startswith(ex + "/") for ex in excluded)
 
 
 def iter_jsonl_files() -> list[dict]:
@@ -24,11 +51,14 @@ def iter_jsonl_files() -> list[dict]:
     if not PROJECTS_DIR.exists():
         return []
 
+    excluded = load_excluded_projects()
     results = []
     for project_dir in sorted(PROJECTS_DIR.iterdir()):
         if not project_dir.is_dir():
             continue
         project_path = decode_project_path(project_dir.name)
+        if is_excluded_project(project_path, excluded):
+            continue
 
         for jsonl_file in sorted(project_dir.glob("*.jsonl")):
             mtime = os.path.getmtime(jsonl_file)
@@ -36,7 +66,11 @@ def iter_jsonl_files() -> list[dict]:
                 "path": jsonl_file,
                 "project_path": project_path,
                 "session_id": jsonl_file.stem,
+                "native_session_id": jsonl_file.stem,
+                "source": "claude",
+                "thread_kind": "user",
                 "mtime": mtime,
+                "size": os.path.getsize(jsonl_file),
             })
 
     return results
@@ -250,11 +284,17 @@ def file_info_from_path(transcript_path: str | Path) -> dict | None:
         return None
 
     project_path = decode_project_path(parts[0])
+    if is_excluded_project(project_path):
+        return None
     result = {
         "path": path,
         "project_path": project_path,
         "session_id": path.stem,
+        "native_session_id": path.stem,
+        "source": "claude",
+        "thread_kind": "user",
         "mtime": os.path.getmtime(path),
+        "size": os.path.getsize(path),
     }
 
     # Subagent: {project}/{parent_session_id}/subagents/{session_id}.jsonl
@@ -297,9 +337,14 @@ def _load_git_remote_cache() -> dict[str, str | None]:
 def _save_git_remote_cache() -> None:
     if _git_remote_cache is None:
         return
-    GIT_REMOTE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(GIT_REMOTE_CACHE_PATH, "w") as f:
-        json.dump(_git_remote_cache, f, indent=2)
+    try:
+        GIT_REMOTE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(GIT_REMOTE_CACHE_PATH, "w") as f:
+            json.dump(_git_remote_cache, f, indent=2)
+    except OSError:
+        # Read-only/sandboxed runs can still index; they simply do not persist
+        # this optional performance cache.
+        pass
 
 
 def detect_git_remote(project_path: str) -> str | None:
@@ -515,5 +560,5 @@ def group_assistant_messages(messages: list[dict]) -> list[dict]:
     for msg in assistant_by_request.values():
         grouped.append(msg)
 
-    grouped.sort(key=lambda m: m.get("timestamp", ""))
+    grouped.sort(key=lambda m: m.get("timestamp") or "")
     return grouped
