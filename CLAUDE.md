@@ -1,6 +1,6 @@
 # claude-chat-search
 
-Semantic search over Claude Code conversations. Indexes JSONL conversation files, chunks them, embeds with a 384-dim model, and stores in SQLite with sqlite-vec for vector search + FTS5 for text search.
+Semantic search over Claude Code and Codex conversations. Indexes JSONL conversation files, chunks them, embeds with a 384-dim model, and stores in SQLite with sqlite-vec for vector search + FTS5 for text search.
 
 ## Architecture
 
@@ -8,6 +8,8 @@ Semantic search over Claude Code conversations. Indexes JSONL conversation files
 - `cli.py` — Click CLI: `init`, `index`, `search`, `daemon start/stop`, etc.
 - `daemon.py` — Background process that watches for new/changed conversations and indexes them.
 - `parser.py` — Parses Claude Code JSONL conversation files, extracts metadata.
+- `codex_parser.py` — Parses only visible conversation from Codex rollout files; excludes system/developer prompts, reasoning, tools, outputs, state, and subagent rollouts.
+- `sources.py` — Source-neutral discovery/parser dispatch.
 - `chunker.py` — Splits conversations into searchable chunks.
 - `embedder.py` — Embeds chunks (384-dim model).
 - `vector_search.py` — NumPy-cached vector search (faster than sqlite-vec for large result sets).
@@ -18,6 +20,8 @@ Semantic search over Claude Code conversations. Indexes JSONL conversation files
 ## DB Schema (index.db in ~/.claude-chat-search/)
 
 Tables: `sessions`, `subagents`, `chunks`, `chunks_fts` (FTS5), `vec_chunks` (sqlite-vec).
+
+Codex sessions use namespaced internal IDs (`codex:<native-id>`) and retain the native ID in `sessions.native_session_id`. Never feed Codex `response_item` records into chunks: they contain reasoning, tool arguments, and outputs that are intentionally outside the searchable conversation corpus.
 
 ### FK Delete Order — CRITICAL
 

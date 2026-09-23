@@ -1,12 +1,33 @@
 from __future__ import annotations
 
+import fcntl
+from contextlib import contextmanager
+
 from limbic.amygdala import EmbeddingModel
 
+from . import db
 from .db import get_unembedded_chunks, insert_embeddings
 
 BATCH_SIZE = 256
 
 _model: EmbeddingModel | None = None
+
+
+@contextmanager
+def embedding_lock():
+    """Yield True only to the single process allowed to compute embeddings."""
+    db.DB_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = db.DB_DIR / ".embedding.lock"
+    with lock_path.open("a+") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _get_model() -> EmbeddingModel:
@@ -35,6 +56,13 @@ def embed_query(text: str) -> list[float]:
 
 def process_embeddings(conn, callback=None) -> int:
     """Generate embeddings for all unembedded chunks. Returns count processed."""
+    with embedding_lock() as acquired:
+        if not acquired:
+            return 0
+        return _process_embeddings_locked(conn, callback)
+
+
+def _process_embeddings_locked(conn, callback=None) -> int:
     total = 0
 
     while True:

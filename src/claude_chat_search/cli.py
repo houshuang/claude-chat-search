@@ -1,7 +1,9 @@
 import json
+import hashlib
 import sys
 import time as _time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import click
 
@@ -9,10 +11,12 @@ from .chunker import create_chunks
 from .db import (
     DB_PATH,
     _fetchall,
+    backup_database,
     delete_session_data,
     get_connection,
     get_indexed_sessions,
     get_session,
+    get_session_ids_by_source,
     get_session_chunks,
     get_stats,
     get_subagent,
@@ -23,34 +27,67 @@ from .db import (
     insert_chunks,
     insert_session,
     insert_subagent,
+    update_session_fingerprint,
     update_session_git_remote,
 )
 from .parser import (
+    EXCLUDED_PROJECTS_PATH,
     detect_git_remote,
-    extract_session_metadata,
     find_project_dir,
-    iter_jsonl_files,
     iter_subagent_files,
-    parse_jsonl_file,
+    load_excluded_projects,
     parse_subagent_conversation,
     parse_subagent_metadata,
+)
+from .sources import (
+    SOURCE_NAMES,
+    extract_conversation_metadata,
+    iter_conversation_files,
+    parse_conversation_file,
 )
 
 
 @click.group()
 def cli():
-    """Semantic search over Claude Code conversations."""
+    """Semantic search over Claude Code and Codex conversations."""
     pass
 
 
 @cli.command()
-def init():
+@click.option(
+    "--destination", type=click.Path(path_type=Path), default=None,
+    help="Backup file path (default: timestamped file under the index directory)",
+)
+def backup(destination):
+    """Create a consistent online backup of the conversation index."""
+    # Deliberately do not call init_db here: backup must happen before any
+    # pending additive schema migration.
+    conn = get_connection()
+    try:
+        backup_path = backup_database(conn, destination)
+    finally:
+        conn.close()
+
+    digest = hashlib.sha256()
+    with backup_path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    click.echo(f"Backup: {backup_path}")
+    click.echo(f"SHA-256: {digest.hexdigest()}")
+
+
+@cli.command()
+@click.option(
+    "--source", type=click.Choice(SOURCE_NAMES), default="claude", show_default=True,
+    help="Conversation source to index",
+)
+def init(source):
     """Initialize the database and index all conversations."""
     conn = get_connection()
     init_db(conn)
     click.echo(f"Database created at {DB_PATH}")
 
-    _run_index(conn, force=True)
+    _run_index(conn, force=True, source=source)
     _run_embed(conn)
 
     stats = get_stats(conn)
@@ -61,30 +98,39 @@ def init():
 @cli.command()
 @click.option("--all", "index_all", is_flag=True, help="Re-index everything from scratch")
 @click.option("--force", is_flag=True, help="Force re-index even if already indexed")
-def index(index_all, force):
+@click.option(
+    "--source", type=click.Choice(SOURCE_NAMES), default="claude", show_default=True,
+    help="Conversation source to index",
+)
+def index(index_all, force, source):
     """Index new or updated conversations."""
     conn = get_connection()
     init_db(conn)
 
     if index_all and force:
-        click.echo("Re-indexing everything from scratch...")
-        # Drop and recreate vec table — sqlite-vec doesn't reclaim space on DELETE
-        conn.execute("DROP TABLE IF EXISTS vec_chunks")
-        from .db import EMBEDDING_DIM
-        conn.execute(f"""
-            CREATE VIRTUAL TABLE vec_chunks USING vec0(
-                chunk_id INTEGER PRIMARY KEY,
-                embedding FLOAT[{EMBEDDING_DIM}]
-            )
-        """)
-        conn.execute("PRAGMA foreign_keys=OFF")
-        conn.execute("DELETE FROM chunks")
-        conn.execute("DELETE FROM sessions")
-        conn.execute("PRAGMA foreign_keys=ON")
+        click.echo(f"Re-indexing {source} conversations from scratch...")
+        if source == "all":
+            # Drop and recreate vec table — sqlite-vec doesn't reclaim space on DELETE
+            conn.execute("DROP TABLE IF EXISTS vec_chunks")
+            from .db import EMBEDDING_DIM
+            conn.execute(f"""
+                CREATE VIRTUAL TABLE vec_chunks USING vec0(
+                    chunk_id INTEGER PRIMARY KEY,
+                    embedding FLOAT[{EMBEDDING_DIM}]
+                )
+            """)
+            conn.execute("PRAGMA foreign_keys=OFF")
+            conn.execute("DELETE FROM chunks")
+            conn.execute("DELETE FROM subagents")
+            conn.execute("DELETE FROM sessions")
+            conn.execute("PRAGMA foreign_keys=ON")
+        else:
+            for session_id in get_session_ids_by_source(conn, source):
+                delete_session_data(conn, session_id)
         from .vector_search import invalidate_cache
         invalidate_cache()
 
-    _run_index(conn, force=force or index_all)
+    _run_index(conn, force=force or index_all, source=source)
     _run_embed(conn)
 
     stats = get_stats(conn)
@@ -156,7 +202,14 @@ def _log_search(query: str, mode: str, results: list[dict], latency_ms: float,
 @click.option("--file", "file_mode", is_flag=True, help="Search by file path in session metadata")
 @click.option("--rerank", "do_rerank", is_flag=True, help="Re-score with cross-encoder (slower, more accurate)")
 @click.option("--expand", "do_expand", is_flag=True, help="LLM query expansion for better recall (~3-5s extra)")
-def search(query, limit, project, branch, since, before, grep_mode, file_mode, do_rerank, do_expand):
+@click.option(
+    "--source", type=click.Choice(SOURCE_NAMES), default="all", show_default=True,
+    help="Limit results to one conversation source",
+)
+def search(
+    query, limit, project, branch, since, before, grep_mode, file_mode,
+    do_rerank, do_expand, source,
+):
     """Search past conversations."""
     from .search import file_search, grep_search, hybrid_search
 
@@ -165,20 +218,24 @@ def search(query, limit, project, branch, since, before, grep_mode, file_mode, d
 
     since_iso = _parse_date(since) if since else None
     before_iso = _parse_date(before) if before else None
+    source_filter = None if source == "all" else source
 
     mode = "file" if file_mode else "grep" if grep_mode else "hybrid"
     t0 = _time.monotonic()
 
     if file_mode:
         results = file_search(conn, query, limit=limit, project=project,
-                              branch=branch, since=since_iso, before=before_iso)
+                              branch=branch, since=since_iso, before=before_iso,
+                              source=source_filter)
     elif grep_mode:
         results = grep_search(conn, query, limit=limit, project=project,
-                              branch=branch, since=since_iso, before=before_iso)
+                              branch=branch, since=since_iso, before=before_iso,
+                              source=source_filter)
     else:
         results = hybrid_search(conn, query, limit=limit, project=project,
                                 branch=branch, since=since_iso, before=before_iso,
-                                do_rerank=do_rerank, expand=do_expand)
+                                do_rerank=do_rerank, expand=do_expand,
+                                source=source_filter)
 
     filters = {}
     if project:
@@ -189,6 +246,8 @@ def search(query, limit, project, branch, since, before, grep_mode, file_mode, d
         filters["since"] = since
     if before:
         filters["before"] = before
+    if source != "all":
+        filters["source"] = source
     _log_search(query, mode, results, (_time.monotonic() - t0) * 1000,
                 filters or None)
 
@@ -201,7 +260,12 @@ def search(query, limit, project, branch, since, before, grep_mode, file_mode, d
         click.echo(f"\n{'='*70}")
 
         # Header line with score and session
-        click.echo(f"#{i}  score={r['score']:.4f}  session={r['session_id'][:12]}...")
+        native_id = r.get("native_session_id") or r["session_id"]
+        result_source = r.get("source", "claude")
+        click.echo(
+            f"#{i}  score={r['score']:.4f}  source={result_source}  "
+            f"session={native_id[:12]}..."
+        )
 
         # Metadata
         meta_parts = []
@@ -258,7 +322,8 @@ def show(session_id, turn, context, with_subagents):
         conn.close()
         return
 
-    click.echo(f"Session: {session['session_id']}")
+    click.echo(f"Session: {session.get('native_session_id') or session['session_id']}")
+    click.echo(f"Source: {session.get('source', 'claude')}")
     click.echo(f"Project: {session['project_path']}")
     if session["slug"]:
         click.echo(f"Slug: {session['slug']}")
@@ -445,10 +510,17 @@ def _resolve_session(conn, session_id: str) -> dict | None:
     """Resolve a session by exact or partial ID match. Prints errors on failure."""
     session = get_session(conn, session_id)
     if session is None:
+        session = next(iter(_fetchall(
+            conn,
+            "SELECT * FROM sessions WHERE native_session_id = ?",
+            (session_id,),
+        )), None)
+    if session is None:
         rows = _fetchall(
             conn,
-            "SELECT * FROM sessions WHERE session_id LIKE ?",
-            (f"{session_id}%",),
+            """SELECT * FROM sessions
+               WHERE session_id LIKE ? OR native_session_id LIKE ?""",
+            (f"{session_id}%", f"{session_id}%"),
         )
         if len(rows) == 1:
             session = rows[0]
@@ -631,7 +703,12 @@ def cross(query, limit, project, branch, since, before, do_expand):
         source_label = f"[{r['source']}]"
 
         if r["source"] == "chat":
-            click.echo(f"#{i}  {source_label}  score={r['score']:.4f}  session={r['session_id'][:12]}...")
+            native_id = r.get("native_session_id") or r["session_id"]
+            chat_source = r.get("chat_source", "claude")
+            click.echo(
+                f"#{i}  [chat:{chat_source}]  score={r['score']:.4f}  "
+                f"session={native_id[:12]}..."
+            )
 
             meta_parts = []
             if r.get("project_path"):
@@ -812,6 +889,73 @@ def resume(query, limit, project, branch, since, before, do_fork):
 
 
 @cli.group()
+def exclude():
+    """Manage project paths excluded from indexing."""
+    pass
+
+
+def _purge_project(conn, project_path: str) -> int:
+    """Delete all indexed sessions (and their chunks/subagents) for a project
+    and any project nested under it."""
+    rows = _fetchall(
+        conn,
+        "SELECT session_id FROM sessions WHERE project_path = ? OR project_path LIKE ?",
+        (project_path, project_path + "/%"),
+    )
+    for row in rows:
+        delete_session_data(conn, row["session_id"])
+    return len(rows)
+
+
+@exclude.command("add")
+@click.argument("project_path")
+def exclude_add(project_path):
+    """Exclude a project path from indexing and purge its existing index data."""
+    project_path = project_path.rstrip("/")
+    excluded = load_excluded_projects()
+    if project_path in excluded:
+        click.echo(f"Already excluded: {project_path}")
+    else:
+        EXCLUDED_PROJECTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(EXCLUDED_PROJECTS_PATH, "a") as f:
+            f.write(project_path + "\n")
+        click.echo(f"Excluded: {project_path}")
+
+    conn = get_connection()
+    init_db(conn)
+    purged = _purge_project(conn, project_path)
+    conn.close()
+    click.echo(f"Purged {purged} indexed session(s) for {project_path}")
+
+
+@exclude.command("remove")
+@click.argument("project_path")
+def exclude_remove(project_path):
+    """Stop excluding a project path (it will be re-indexed on next scan)."""
+    project_path = project_path.rstrip("/")
+    excluded = load_excluded_projects()
+    if project_path not in excluded:
+        click.echo(f"Not excluded: {project_path}")
+        return
+    excluded.discard(project_path)
+    EXCLUDED_PROJECTS_PATH.write_text(
+        "".join(p + "\n" for p in sorted(excluded))
+    )
+    click.echo(f"Removed exclusion: {project_path} (will re-index on next daemon scan)")
+
+
+@exclude.command("list")
+def exclude_list():
+    """List excluded project paths."""
+    excluded = sorted(load_excluded_projects())
+    if not excluded:
+        click.echo("No excluded projects")
+        return
+    for p in excluded:
+        click.echo(p)
+
+
+@cli.group()
 def daemon():
     """Manage the indexer daemon."""
     pass
@@ -845,10 +989,10 @@ def daemon_status():
     status()
 
 
-def _run_index(conn, force: bool = False) -> int:
+def _run_index(conn, force: bool = False, source: str = "claude") -> int:
     """Index JSONL files. Returns number of sessions indexed."""
-    files = iter_jsonl_files()
-    indexed = get_indexed_sessions(conn)
+    files = iter_conversation_files(source)
+    indexed = get_indexed_sessions(conn, None if source == "all" else source)
     now = datetime.now(timezone.utc).isoformat()
 
     new_count = 0
@@ -857,22 +1001,36 @@ def _run_index(conn, force: bool = False) -> int:
     with click.progressbar(files, label="Indexing sessions", file=sys.stderr) as bar:
         for file_info in bar:
             sid = file_info["session_id"]
-            mtime_str = datetime.fromtimestamp(file_info["mtime"], tz=timezone.utc).isoformat()
+            existing = indexed.get(sid)
 
-            if not force and sid in indexed:
-                existing_time = indexed[sid]
-                if existing_time and existing_time >= mtime_str:
+            if not force and existing:
+                same_fingerprint = (
+                    existing.get("transcript_mtime") == file_info.get("mtime")
+                    and existing.get("transcript_size") == file_info.get("size")
+                )
+                if same_fingerprint:
+                    if existing.get("transcript_path") != str(file_info["path"]):
+                        update_session_fingerprint(conn, sid, file_info)
                     skip_count += 1
                     continue
 
-            # Re-index this session (preserve topic_summary across re-index)
-            saved_summary = None
-            if sid in indexed:
-                saved_summary = get_topic_summary(conn, sid)
-                delete_session_data(conn, sid)
+                # Compatibility fallback for rows indexed before fingerprints
+                # were stored.  Such rows will gain a fingerprint next time they
+                # actually change.
+                mtime_str = datetime.fromtimestamp(
+                    file_info["mtime"], tz=timezone.utc
+                ).isoformat()
+                if (
+                    existing.get("transcript_mtime") is None
+                    and existing.get("indexed_at")
+                    and existing["indexed_at"] >= mtime_str
+                ):
+                    update_session_fingerprint(conn, sid, file_info)
+                    skip_count += 1
+                    continue
 
             try:
-                session_data = parse_jsonl_file(file_info["path"])
+                session_data = parse_conversation_file(file_info)
             except Exception as e:
                 click.echo(f"\nError parsing {file_info['path']}: {e}", err=True)
                 continue
@@ -880,30 +1038,52 @@ def _run_index(conn, force: bool = False) -> int:
             if not session_data["messages"]:
                 continue
 
-            session_data["project_path"] = file_info["project_path"]
+            session_data["project_path"] = (
+                session_data.get("cwd") or file_info["project_path"]
+            )
             session_data["indexed_at"] = now
             session_data["parent_session_id"] = file_info.get("parent_session_id")
+            session_data["source"] = file_info.get("source", "claude")
+            session_data["native_session_id"] = file_info.get("native_session_id", sid)
+            session_data["thread_kind"] = file_info.get("thread_kind", "user")
+            session_data["transcript_path"] = str(file_info["path"])
+            session_data["transcript_mtime"] = file_info.get("mtime")
+            session_data["transcript_size"] = file_info.get("size")
 
-            # Extract structured metadata from tool calls
-            metadata = extract_session_metadata(session_data["messages"])
+            metadata = extract_conversation_metadata(session_data)
             session_data.update(metadata)
-
-            insert_session(conn, session_data)
-            if saved_summary:
-                from .db import update_topic_summary
-                update_topic_summary(conn, sid, saved_summary)
             chunks = create_chunks(session_data)
-            if chunks:
-                insert_chunks(conn, chunks)
+
+            # Build the replacement completely before deleting the old data,
+            # then swap it inside one transaction.  A malformed active rollout
+            # can never erase a previously indexed conversation.
+            saved_summary = get_topic_summary(conn, sid) if existing else None
+            with conn:
+                if existing:
+                    delete_session_data(conn, sid)
+                insert_session(conn, session_data)
+                if saved_summary:
+                    from .db import update_topic_summary
+                    update_topic_summary(conn, sid, saved_summary)
+                if chunks:
+                    insert_chunks(conn, chunks)
 
             new_count += 1
 
-    click.echo(f"Indexed {new_count} sessions ({skip_count} skipped)", err=True)
+    click.echo(
+        f"Indexed {new_count} {source} sessions ({skip_count} unchanged)", err=True
+    )
 
     # Backfill git remotes for sessions missing them
-    remote_rows = list(conn.execute(
-        "SELECT DISTINCT project_path FROM sessions WHERE git_remote IS NULL"
-    ))
+    remote_sql = (
+        "SELECT DISTINCT project_path FROM sessions "
+        "WHERE git_remote IS NULL AND project_path IS NOT NULL AND project_path != ''"
+    )
+    remote_bindings = ()
+    if source != "all":
+        remote_sql += " AND source = ?"
+        remote_bindings = (source,)
+    remote_rows = list(conn.execute(remote_sql, remote_bindings))
     if remote_rows:
         remote_count = 0
         for (project_path,) in remote_rows:
@@ -917,7 +1097,11 @@ def _run_index(conn, force: bool = False) -> int:
     # Index subagent metadata
     sub_count = 0
     now = datetime.now(timezone.utc).isoformat()
-    all_sessions = list(conn.execute("SELECT session_id, project_path FROM sessions"))
+    all_sessions = []
+    if source in {"all", "claude"}:
+        all_sessions = list(conn.execute(
+            "SELECT session_id, project_path FROM sessions WHERE source = 'claude'"
+        ))
     for (sid, proj_path) in all_sessions:
         project_dir = find_project_dir(proj_path)
         if not project_dir:
