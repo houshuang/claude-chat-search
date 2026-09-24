@@ -278,6 +278,12 @@ class SearchServiceTests(FastSearchCase):
         self.server = search_service.SearchServer()
         self.server.start()
         self.addCleanup(self.server.stop)
+        self.server.service.ready.set()
+
+    def test_warming_daemon_refuses_searches_so_the_cli_falls_back(self):
+        self.server.service.ready.clear()
+        self.assertEqual(search_service.request("ping", {}, 1), {"ok": True, "ready": False})
+        self.assertIsNone(search_service.request("search", {"query": "socket search"}, 1))
 
     def test_socket_is_private(self):
         mode = stat.S_IMODE(os.stat(search_service.socket_path()).st_mode)
