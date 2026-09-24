@@ -17,13 +17,13 @@ from test_hardening import TempIndexCase
 
 
 def unit(i: int, weight: float = 1.0) -> list[float]:
-    vec = [0.0] * db.EMBEDDING_DIM
+    vec = [0.0] * db.embedding_dim()
     vec[i] = weight
     return vec
 
 
 def blend(i: int, j: int, wi: float) -> list[float]:
-    vec = [0.0] * db.EMBEDDING_DIM
+    vec = [0.0] * db.embedding_dim()
     vec[i] = wi
     vec[j] = 1.0 - wi
     return vec

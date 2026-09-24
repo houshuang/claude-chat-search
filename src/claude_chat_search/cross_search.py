@@ -1,7 +1,7 @@
 """Cross-index search: queries both the chat index and the research index.
 
-Both indices use 384-dim embeddings, so we embed the query once
-and search both with the same vector.
+Each index is searched with a query embedding from its own model: the
+research index (otak's index_research) embeds the query in its subprocess.
 """
 
 import json
@@ -9,6 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from .db import embedding_mismatch
 from .embedder import embed_query
 from .search import RRF_K, _session_filter_sql, fused_session_results
 
@@ -16,8 +17,12 @@ OTAK_VENV_PYTHON = "/Users/stian/src/otak/.venv-otak/bin/python3"
 RESEARCH_INDEX_DB = Path("/Users/stian/src/otak/data/research_index.db")
 
 
-def _search_research_index(query_embedding: list[float], limit: int = 20) -> list[dict]:
+def _search_research_index(query: str, limit: int = 20) -> list[dict]:
     """Search the research index via subprocess (needs otak venv for numpy/index_research).
+
+    The query is embedded there with the research index's own model:
+    index_research.get_embedding_model() when otak provides it, otherwise the
+    multilingual MiniLM the research index has always been built with.
 
     Returns list of dicts with score, source_file, section, content, tokens.
     """
@@ -25,13 +30,19 @@ def _search_research_index(query_embedding: list[float], limit: int = 20) -> lis
         return []
 
     script = f"""
-import sys, json, struct
+import sys, json
 import numpy as np
 sys.path.insert(0, "/Users/stian/src/otak/scripts")
+import index_research
 from index_research import load_index, search_index
 
-embedding = json.loads(sys.stdin.read())
-q_emb = np.array(embedding, dtype=np.float32)
+query = sys.stdin.read()
+if hasattr(index_research, "get_embedding_model"):
+    model = index_research.get_embedding_model()
+else:
+    from limbic.amygdala import EmbeddingModel
+    model = EmbeddingModel("paraphrase-multilingual-MiniLM-L12-v2")
+q_emb = np.asarray(model.embed(query), dtype=np.float32)
 
 emb_matrix, chunks = load_index()
 if emb_matrix.shape[0] == 0:
@@ -44,7 +55,7 @@ else:
     try:
         proc = subprocess.run(
             [OTAK_VENV_PYTHON, "-c", script],
-            input=json.dumps(query_embedding),
+            input=query,
             capture_output=True,
             text=True,
             timeout=30,
@@ -62,7 +73,7 @@ else:
 def chat_candidates(
     conn,
     query: str,
-    query_embedding: list[float],
+    query_embedding: list[float] | None,
     limit: int = 10,
     project: str | None = None,
     branch: str | None = None,
@@ -93,17 +104,17 @@ def cross_search(
     """Search both chat and research indices, merge with RRF.
 
     `chat` is a precomputed (chat_candidates() result, query embedding) pair,
-    as returned by the daemon.  Returns a unified list where each result has
-    a 'source' field: 'chat' or 'research'.
+    as returned by the daemon; only the candidates are used.  Returns a
+    unified list where each result has a 'source' field: 'chat' or 'research'.
     """
     fetch_limit = limit * 5
     if chat is None:
-        query_embedding = embed_query(query)
+        query_embedding = embed_query(query) if embedding_mismatch(conn) is None else None
         candidates = chat_candidates(
             conn, query, query_embedding, limit, project, branch, since, before, expand
         )
     else:
-        candidates, query_embedding = chat
+        candidates, _ = chat
 
     chat_results = [
         {
@@ -127,7 +138,7 @@ def cross_search(
     ]
 
     # --- Research search ---
-    research_raw = _search_research_index(query_embedding, limit=fetch_limit)
+    research_raw = _search_research_index(query, limit=fetch_limit)
     research_results = []
     seen_files: set[str] = set()
     for r in research_raw:

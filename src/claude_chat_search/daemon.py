@@ -283,7 +283,13 @@ def full_scan(conn) -> int:
 
 def run_embeddings(conn):
     """Run embedding pipeline in batches, checking shutdown between batches."""
+    from .db import embedding_mismatch
     from .embedder import EmbeddingUnavailable, embed_rows, embedding_lock
+
+    mismatch = embedding_mismatch(conn)
+    if mismatch:
+        logger.warning("Embedding pass skipped: %s", mismatch)
+        return
 
     with embedding_lock() as acquired:
         if not acquired:

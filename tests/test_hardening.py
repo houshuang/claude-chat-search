@@ -52,7 +52,7 @@ class TempIndexCase(unittest.TestCase):
             "session_id": sid, "user_content": "q", "assistant_content": "a",
             "combined_text": f"text for {sid} {i}", "turn_number": i,
         } for i in range(chunks)])
-        db.insert_embeddings(self.conn, ids, [[0.1] * db.EMBEDDING_DIM for _ in ids])
+        db.insert_embeddings(self.conn, ids, [[0.1] * db.embedding_dim() for _ in ids])
 
 
 class ConnectionTests(TempIndexCase):
@@ -90,7 +90,7 @@ class ConnectionTests(TempIndexCase):
             "session_id": "s1", "user_content": "", "assistant_content": "",
             "combined_text": f"t{i}", "turn_number": i,
         } for i in range(3)])
-        bad = [[0.1] * db.EMBEDDING_DIM, [0.1] * db.EMBEDDING_DIM, [0.1] * 3]
+        bad = [[0.1] * db.embedding_dim(), [0.1] * db.embedding_dim(), [0.1] * 3]
         with self.assertRaises(apsw.Error):
             db.insert_embeddings(self.conn, ids, bad)
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM vec_chunks").fetchone()[0], 0)
@@ -235,7 +235,7 @@ class EmbeddingIsolationTests(TempIndexCase):
         def fake_embed(texts):
             if any("POISON" in t for t in texts):
                 raise ValueError("cannot embed")
-            return [[0.1] * db.EMBEDDING_DIM for _ in texts]
+            return [[0.1] * db.embedding_dim() for _ in texts]
 
         with patch.object(embedder, "embed_texts", side_effect=fake_embed):
             rows = db.get_unembedded_chunks(self.conn, 10)

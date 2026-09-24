@@ -1,6 +1,7 @@
 from limbic.amygdala import expand_query, multi_list_rrf
 
 from .db import (
+    embedding_mismatch,
     file_search as db_file_search,
     fts_search,
     get_chunks_by_ids,
@@ -143,7 +144,7 @@ def _result_from_chunk(chunk: dict, score: float) -> dict:
 def fused_session_results(
     conn,
     query: str,
-    query_embedding: list[float],
+    query_embedding: list[float] | None,
     limit: int,
     session_filter: tuple[str, list] | None = None,
     expand: bool = False,
@@ -153,16 +154,20 @@ def fused_session_results(
 
     Each ranking contributes fetch_limit chunks (default 5 x limit).  The
     session filter is applied while candidates are selected, so a narrow
-    filter still gets a full candidate list from inside the filter.
+    filter still gets a full candidate list from inside the filter.  Without
+    a query embedding, or when the stored vectors come from another model
+    (see db.embedding_mismatch), only the FTS ranking is used.
     """
     allowed_sessions = _sessions_matching(conn, session_filter)
     if allowed_sessions is not None and not allowed_sessions:
         return []
 
     fetch_limit = fetch_limit or limit * 5
-    vec_results = numpy_vector_search(
-        conn, query_embedding, limit=fetch_limit, allowed_sessions=allowed_sessions
-    )
+    vec_results = []
+    if query_embedding is not None and embedding_mismatch(conn) is None:
+        vec_results = numpy_vector_search(
+            conn, query_embedding, limit=fetch_limit, allowed_sessions=allowed_sessions
+        )
     fts_results = fts_search(conn, query, limit=fetch_limit, session_filter=session_filter)
 
     if expand:
@@ -219,7 +224,7 @@ def hybrid_search(
     candidate sessions before the list is cut to `limit`.
     """
     session_filter = _session_filter_sql(conn, project, branch, since, before, source)
-    if query_embedding is None:
+    if query_embedding is None and embedding_mismatch(conn) is None:
         query_embedding = embed_query(query)
 
     pool = limit * RERANK_POOL if do_rerank else limit
@@ -263,7 +268,7 @@ def _expanded_search(conn, query, vec_results, fts_results, fetch_limit,
                 conn, eq.query, limit=fetch_limit, session_filter=session_filter
             ))
             labels.append(f"fts:{eq.query[:30]}")
-        elif eq.type in ("vec", "hyde"):
+        elif eq.type in ("vec", "hyde") and embedding_mismatch(conn) is None:
             emb = embed_query(eq.query)
             ranked_lists.append(numpy_vector_search(
                 conn, emb, limit=fetch_limit, allowed_sessions=allowed_sessions

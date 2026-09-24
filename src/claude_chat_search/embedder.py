@@ -5,10 +5,9 @@ import logging
 import threading
 from contextlib import contextmanager
 
-from limbic.amygdala import EmbeddingModel
-
 from . import db
-from .db import get_unembedded_chunks, insert_embeddings, mark_embedding_failed
+from .db import embedding_mismatch, get_unembedded_chunks, insert_embeddings, mark_embedding_failed
+from .models import ModelSpec, configured_model
 
 BATCH_SIZE = 256
 
@@ -18,12 +17,13 @@ logger = logging.getLogger(__name__)
 class EmbeddingUnavailable(RuntimeError):
     """The model fails even on a trivial input, so no row can be blamed."""
 
-_model: EmbeddingModel | None = None
+_model = None
+_spec: ModelSpec | None = None
 # Held for model loading and for each encode call.  In the daemon, query
 # embeddings for socket searches and background chunk embedding share one
 # model; ENCODE_BATCH bounds how long a query waits behind a chunk batch.
 _model_lock = threading.RLock()
-ENCODE_BATCH = 32
+ENCODE_BATCH = 16
 
 
 @contextmanager
@@ -43,38 +43,61 @@ def embedding_lock():
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def _get_model() -> EmbeddingModel:
-    global _model
+def _get_model():
+    global _model, _spec
     with _model_lock:
         if _model is None:
-            _model = EmbeddingModel()
-            _model._load_model()
-        return _model
+            import torch
+            from sentence_transformers import SentenceTransformer
+            _spec = configured_model()
+            kwargs = {}
+            gpu = torch.backends.mps.is_available() or torch.cuda.is_available()
+            if _spec.half_precision and gpu:
+                kwargs["model_kwargs"] = {"torch_dtype": torch.float16}
+            _model = SentenceTransformer(_spec.name, **kwargs)
+            _model.max_seq_length = _spec.max_tokens
+        return _model, _spec
 
 
-def embed_texts(texts: list[str], show_progress: bool = False) -> list[list[float]]:
+def _encode(model, texts: list[str], show_progress: bool = False):
     import numpy as np
-    model = _get_model()
-    prepared = [model._prepare_text(t) for t in texts]
+    # Batches of similar length pad less; results go back in input order.
+    order = sorted(range(len(texts)), key=lambda i: len(texts[i]))
     vecs = []
-    for start in range(0, len(prepared), ENCODE_BATCH):
+    for start in range(0, len(order), ENCODE_BATCH):
+        batch = [texts[i] for i in order[start:start + ENCODE_BATCH]]
         with _model_lock:
-            vecs.append(model._model.encode(
-                prepared[start:start + ENCODE_BATCH], batch_size=ENCODE_BATCH,
+            vecs.append(model.encode(
+                batch, batch_size=ENCODE_BATCH,
                 normalize_embeddings=True, show_progress_bar=show_progress,
                 convert_to_numpy=True,
             ).astype(np.float32))
-    return np.vstack(vecs).tolist() if vecs else []
+    if not vecs:
+        return np.empty((0, 0), dtype=np.float32)
+    stacked = np.vstack(vecs)
+    out = np.empty_like(stacked)
+    out[order] = stacked
+    return out
+
+
+def embed_texts(texts: list[str], show_progress: bool = False) -> list[list[float]]:
+    """Embed chunk texts as documents."""
+    model, spec = _get_model()
+    return _encode(model, [spec.document_prompt + t for t in texts], show_progress).tolist()
 
 
 def embed_query(text: str) -> list[float]:
-    model = _get_model()
-    with _model_lock:
-        return model.embed(text).tolist()
+    """Embed a search query, with the model's query prompt."""
+    model, spec = _get_model()
+    return _encode(model, [spec.query_prompt + text])[0].tolist()
 
 
 def process_embeddings(conn, callback=None) -> int:
     """Generate embeddings for all unembedded chunks. Returns count processed."""
+    mismatch = embedding_mismatch(conn)
+    if mismatch:
+        logger.warning("Not embedding: %s", mismatch)
+        return 0
     with embedding_lock() as acquired:
         if not acquired:
             return 0
