@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from claude_chat_search import db
+from claude_chat_search import db, parser
 from claude_chat_search.cli import _run_index
 from claude_chat_search.codex_parser import iter_codex_jsonl_files
 from claude_chat_search.embedder import embedding_lock
@@ -20,6 +20,13 @@ class MultiSourceDatabaseTests(unittest.TestCase):
         self.old_db_dir = db.DB_DIR
         db.DB_PATH = self.db_path
         db.DB_DIR = self.db_path.parent
+        # Keep the git-remote cache written during indexing out of the real data dir.
+        for p in (
+            patch.object(parser, "GIT_REMOTE_CACHE_PATH", self.db_path.parent / "git-remotes.json"),
+            patch.object(parser, "_git_remote_cache", None),
+        ):
+            p.start()
+            self.addCleanup(p.stop)
         self.conn = db.get_connection()
         db.init_db(self.conn)
 
@@ -35,7 +42,8 @@ class MultiSourceDatabaseTests(unittest.TestCase):
                (session_id, project_path, message_count, indexed_at)
                VALUES ('old-session', '/tmp/project', 2, '2026-01-01T00:00:00Z')"""
         )
-        # init_db is intentionally idempotent and performs additive backfills.
+        # Simulate a database created before migrations were versioned.
+        self.conn.execute("PRAGMA user_version = 0")
         db.init_db(self.conn)
         row = db.get_session(self.conn, "old-session")
         self.assertEqual(row["source"], "claude")

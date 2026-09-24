@@ -1,5 +1,6 @@
 import json
 import hashlib
+import os
 import sys
 import time as _time
 from datetime import datetime, timezone
@@ -15,6 +16,7 @@ from .db import (
     delete_session_data,
     get_connection,
     get_indexed_sessions,
+    get_read_connection,
     get_session,
     get_session_ids_by_source,
     get_session_chunks,
@@ -27,13 +29,17 @@ from .db import (
     insert_chunks,
     insert_session,
     insert_subagent,
+    integrity_check,
+    prune_backups,
     update_session_fingerprint,
     update_session_git_remote,
 )
 from .parser import (
     EXCLUDED_PROJECTS_PATH,
+    PROJECTS_DIR,
     detect_git_remote,
     find_project_dir,
+    is_excluded_project,
     iter_subagent_files,
     load_excluded_projects,
     parse_subagent_conversation,
@@ -58,22 +64,42 @@ def cli():
     "--destination", type=click.Path(path_type=Path), default=None,
     help="Backup file path (default: timestamped file under the index directory)",
 )
-def backup(destination):
+@click.option(
+    "--keep", type=click.IntRange(min=1), default=None,
+    help="Keep only the newest N timestamped backups (index-*.db) in the backup directory",
+)
+def backup(destination, keep):
     """Create a consistent online backup of the conversation index."""
     # Deliberately do not call init_db here: backup must happen before any
     # pending additive schema migration.
-    conn = get_connection()
+    conn = get_connection(readonly=True)
     try:
         backup_path = backup_database(conn, destination)
     finally:
         conn.close()
+
+    problems = integrity_check(backup_path)
+    if problems:
+        failed = backup_path.with_name(backup_path.name + ".failed-integrity")
+        backup_path.rename(failed)
+        for line in problems[:20]:
+            click.echo(f"integrity_check: {line}", err=True)
+        raise click.ClickException(
+            f"Backup failed integrity_check; kept for inspection at {failed}. "
+            "No older backups were pruned."
+        )
 
     digest = hashlib.sha256()
     with backup_path.open("rb") as handle:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     click.echo(f"Backup: {backup_path}")
+    click.echo("Integrity check: ok")
     click.echo(f"SHA-256: {digest.hexdigest()}")
+
+    if keep is not None:
+        for removed in prune_backups(backup_path.parent, keep):
+            click.echo(f"Pruned: {removed}")
 
 
 @cli.command()
@@ -130,12 +156,22 @@ def index(index_all, force, source):
         from .vector_search import invalidate_cache
         invalidate_cache()
 
-    _run_index(conn, force=force or index_all, source=source)
+    run_stats: dict = {}
+    _run_index(conn, force=force or index_all, source=source, stats=run_stats)
     _run_embed(conn)
 
     stats = get_stats(conn)
     click.echo(f"\nDone: {stats['sessions']} sessions, {stats['chunks']} chunks, {stats['embedded']} embedded")
     conn.close()
+
+    # Every changed, non-empty Codex rollout yielding nothing means the rollout
+    # format moved again; fail so the scheduled job surfaces it.
+    parsed = run_stats.get("codex_parsed_nonempty", 0)
+    if parsed and run_stats.get("codex_zero_yield", 0) == parsed:
+        raise click.ClickException(
+            f"All {parsed} changed Codex rollouts with agent activity yielded 0 messages; "
+            "the Codex rollout format has probably changed"
+        )
 
 
 def _parse_date(value: str) -> str:
@@ -166,6 +202,11 @@ def _parse_date(value: str) -> str:
 def _log_search(query: str, mode: str, results: list[dict], latency_ms: float,
                  filters: dict | None = None):
     """Append a JSON line to the search log with result details."""
+    try:
+        if is_excluded_project(os.getcwd()):
+            return
+    except OSError:
+        pass
     entry = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "query": query,
@@ -213,8 +254,7 @@ def search(
     """Search past conversations."""
     from .search import file_search, grep_search, hybrid_search
 
-    conn = get_connection()
-    init_db(conn)
+    conn = _read_connection()
 
     since_iso = _parse_date(since) if since else None
     before_iso = _parse_date(before) if before else None
@@ -314,8 +354,7 @@ def search(
 @click.option("--with-subagents", is_flag=True, help="Include subagent summaries")
 def show(session_id, turn, context, with_subagents):
     """Show details of a specific session."""
-    conn = get_connection()
-    init_db(conn)
+    conn = _read_connection()
 
     session = _resolve_session(conn, session_id)
     if session is None:
@@ -506,6 +545,13 @@ def subagent(session_id, agent_id, raw):
     conn.close()
 
 
+def _read_connection():
+    try:
+        return get_read_connection()
+    except FileNotFoundError as error:
+        raise click.ClickException(str(error))
+
+
 def _resolve_session(conn, session_id: str) -> dict | None:
     """Resolve a session by exact or partial ID match. Prints errors on failure."""
     session = get_session(conn, session_id)
@@ -552,8 +598,7 @@ def recover(session_id, turns):
     Outputs the most recent turns in a compact LLM-friendly format.
     Supports partial session ID matching.
     """
-    conn = get_connection()
-    init_db(conn)
+    conn = _read_connection()
 
     if session_id is None:
         click.echo("Usage: claude-chat-search recover SESSION_ID", err=True)
@@ -679,8 +724,7 @@ def cross(query, limit, project, branch, since, before, do_expand):
     """Search both chat history and research index."""
     from .cross_search import cross_search
 
-    conn = get_connection()
-    init_db(conn)
+    conn = _read_connection()
 
     since_iso = _parse_date(since) if since else None
     before_iso = _parse_date(before) if before else None
@@ -778,8 +822,7 @@ def resume(query, limit, project, branch, since, before, do_fork):
 
     from .search import hybrid_search
 
-    conn = get_connection()
-    init_db(conn)
+    conn = _read_connection()
 
     since_iso = _parse_date(since) if since else None
     before_iso = _parse_date(before) if before else None
@@ -894,17 +937,58 @@ def exclude():
     pass
 
 
+def _claude_encoded_dir(transcript_path: str | None) -> str | None:
+    if not transcript_path:
+        return None
+    try:
+        return Path(transcript_path).relative_to(PROJECTS_DIR).parts[0]
+    except (ValueError, IndexError):
+        return None
+
+
+def _excluded_sessions(conn, excluded: set[str]) -> list[dict]:
+    """Indexed sessions that belong to an excluded path, matched robustly."""
+    if not excluded:
+        return []
+    rows = _fetchall(
+        conn,
+        "SELECT session_id, project_path, cwd, transcript_path, source FROM sessions",
+    )
+    return [
+        row for row in rows
+        if is_excluded_project(
+            row["project_path"], excluded,
+            cwd=row["cwd"],
+            encoded_dir=_claude_encoded_dir(row["transcript_path"]),
+        )
+    ]
+
+
+def _count_session_rows(conn, session_ids: list[str]) -> tuple[int, int]:
+    chunks = vectors = 0
+    for sid in session_ids:
+        chunks += conn.execute(
+            "SELECT COUNT(*) FROM chunks WHERE session_id = ?", (sid,)
+        ).fetchone()[0]
+        vectors += conn.execute(
+            "SELECT COUNT(*) FROM vec_chunks WHERE chunk_id IN "
+            "(SELECT id FROM chunks WHERE session_id = ?)", (sid,)
+        ).fetchone()[0]
+    return chunks, vectors
+
+
+def _purge_sessions(conn, session_ids: list[str]) -> None:
+    with conn:
+        for sid in session_ids:
+            delete_session_data(conn, sid)
+
+
 def _purge_project(conn, project_path: str) -> int:
     """Delete all indexed sessions (and their chunks/subagents) for a project
     and any project nested under it."""
-    rows = _fetchall(
-        conn,
-        "SELECT session_id FROM sessions WHERE project_path = ? OR project_path LIKE ?",
-        (project_path, project_path + "/%"),
-    )
-    for row in rows:
-        delete_session_data(conn, row["session_id"])
-    return len(rows)
+    sessions = _excluded_sessions(conn, {project_path})
+    _purge_sessions(conn, [row["session_id"] for row in sessions])
+    return len(sessions)
 
 
 @exclude.command("add")
@@ -955,6 +1039,45 @@ def exclude_list():
         click.echo(p)
 
 
+@cli.command("purge-excluded")
+@click.option("--dry-run", is_flag=True, help="Only report what would be deleted")
+def purge_excluded(dry_run):
+    """Delete indexed data (sessions, chunks, FTS, vectors) under excluded paths."""
+    excluded = load_excluded_projects()
+    conn = get_connection()
+    init_db(conn)
+    sessions = _excluded_sessions(conn, excluded)
+    by_path: dict[str, list[str]] = {}
+    for row in sessions:
+        # Attribute each session to the excluded entry it falls under; the
+        # report names excluded paths only, never session content.
+        owner = next(
+            ex for ex in sorted(excluded)
+            if is_excluded_project(
+                row["project_path"], {ex}, cwd=row["cwd"],
+                encoded_dir=_claude_encoded_dir(row["transcript_path"]),
+            )
+        )
+        by_path.setdefault(owner, []).append(row["session_id"])
+
+    total_chunks = total_vectors = 0
+    for ex in sorted(excluded):
+        ids = by_path.get(ex, [])
+        chunks, vectors = _count_session_rows(conn, ids)
+        total_chunks += chunks
+        total_vectors += vectors
+        click.echo(f"{ex}: {len(ids)} session(s), {chunks} chunk(s), {vectors} vector(s)")
+
+    verb = "Would delete" if dry_run else "Deleted"
+    if not dry_run and sessions:
+        _purge_sessions(conn, [row["session_id"] for row in sessions])
+    conn.close()
+    click.echo(
+        f"{verb} {len(sessions)} session(s), {total_chunks} chunk(s), "
+        f"{total_vectors} vector(s)"
+    )
+
+
 @cli.group()
 def daemon():
     """Manage the indexer daemon."""
@@ -989,14 +1112,25 @@ def daemon_status():
     status()
 
 
-def _run_index(conn, force: bool = False, source: str = "claude") -> int:
-    """Index JSONL files. Returns number of sessions indexed."""
+def _run_index(conn, force: bool = False, source: str = "claude",
+               stats: dict | None = None) -> int:
+    """Index JSONL files. Returns number of sessions indexed.
+
+    If given, `stats` is filled with codex_parsed_nonempty / codex_zero_yield
+    counts for the rollouts this run actually parsed ("non-empty" meaning
+    the agent took at least one turn).
+    """
+    stats = {} if stats is None else stats
+    stats.setdefault("codex_parsed_nonempty", 0)
+    stats.setdefault("codex_zero_yield", 0)
     files = iter_conversation_files(source)
     indexed = get_indexed_sessions(conn, None if source == "all" else source)
+    excluded = load_excluded_projects()
     now = datetime.now(timezone.utc).isoformat()
 
     new_count = 0
     skip_count = 0
+    excluded_count = 0
 
     with click.progressbar(files, label="Indexing sessions", file=sys.stderr) as bar:
         for file_info in bar:
@@ -1035,7 +1169,21 @@ def _run_index(conn, force: bool = False, source: str = "claude") -> int:
                 click.echo(f"\nError parsing {file_info['path']}: {e}", err=True)
                 continue
 
+            is_codex = file_info.get("source") == "codex"
+            if is_codex and session_data.get("agent_record_count", 0) > 0:
+                stats["codex_parsed_nonempty"] += 1
+                if not session_data["messages"]:
+                    stats["codex_zero_yield"] += 1
+
             if not session_data["messages"]:
+                continue
+
+            if is_excluded_project(
+                file_info["project_path"], excluded, cwd=session_data.get("cwd")
+            ):
+                excluded_count += 1
+                if existing:
+                    _purge_sessions(conn, [sid])
                 continue
 
             session_data["project_path"] = (
@@ -1073,6 +1221,13 @@ def _run_index(conn, force: bool = False, source: str = "claude") -> int:
     click.echo(
         f"Indexed {new_count} {source} sessions ({skip_count} unchanged)", err=True
     )
+    if excluded_count:
+        click.echo(f"Skipped {excluded_count} session(s) whose cwd is excluded", err=True)
+    if stats["codex_zero_yield"]:
+        click.echo(
+            f"Warning: {stats['codex_zero_yield']} of {stats['codex_parsed_nonempty']} "
+            "Codex rollouts with agent activity yielded 0 messages", err=True,
+        )
 
     # Backfill git remotes for sessions missing them
     remote_sql = (

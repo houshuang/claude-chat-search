@@ -134,5 +134,72 @@ class CodexParserTests(unittest.TestCase):
             self.assertEqual(session["messages"][1]["message"]["content"], "Legacy answer")
 
 
+FIXTURE = Path(__file__).parent / "fixtures" / "codex_rollout_2026_09.jsonl"
+
+
+class CurrentCodexFormatTests(unittest.TestCase):
+    """Rollouts written since September 2026 carry no event_msg conversation."""
+
+    def setUp(self):
+        info = iter_codex_jsonl_files([FIXTURE.parent])[0]
+        self.session = parse_codex_jsonl_file(FIXTURE, info)
+        self.texts = [m["message"]["content"] for m in self.session["messages"]]
+
+    def test_visible_conversation_is_parsed(self):
+        self.assertEqual(self.texts, [
+            "How do the lighthouse keepers rotate their night shifts?",
+            "I will read the rota file first.",
+            "Keepers rotate every third night, and the rota lives in keepers.csv.",
+            "What does the storm clause say?",
+            "Add a spare keeper to the rota.",
+            "The storm clause doubles the watch.",
+        ])
+        self.assertEqual(
+            [m["type"] for m in self.session["messages"]],
+            ["user", "assistant", "assistant", "user", "user", "assistant"],
+        )
+        self.assertEqual(self.session["cwd"], "/tmp/fixture-project")
+        self.assertEqual(self.session["git_branch"], "sh/fixture")
+        self.assertGreater(self.session["agent_record_count"], 0)
+
+    def test_injected_context_and_agent_internals_are_excluded(self):
+        indexed = "\n".join(c["combined_text"] for c in create_chunks(self.session))
+        for noise in (
+            "BASE_INSTRUCTIONS_NOISE", "DEVELOPER_NOISE", "ENVIRONMENT_NOISE",
+            "PLUGIN_NOISE", "AGENTS_NOISE", "REASONING_NOISE", "TOOL_INPUT_NOISE",
+            "TOOL_OUTPUT_NOISE", "FUNCTION_ARGS_NOISE", "FUNCTION_OUTPUT_NOISE",
+            "INTER_AGENT_NOISE", "SUBAGENT_NOISE", "WORLD_STATE_NOISE",
+            "COMPACTION_NOISE", "BROWSER_NOISE", "IDE_NOISE", "ABORT_NOISE",
+            "<image", "AGENTS.md",
+        ):
+            self.assertNotIn(noise, indexed)
+
+    def test_item_completed_events_do_not_duplicate_messages(self):
+        self.assertEqual(
+            self.texts.count("How do the lighthouse keepers rotate their night shifts?"), 1
+        )
+
+    def test_unused_rollout_is_not_counted_as_agent_activity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / f"rollout-unused-{SESSION_ID}.jsonl"
+            write_jsonl(path, [
+                session_meta(),
+                {"timestamp": "2026-09-20T10:00:01Z", "type": "event_msg",
+                 "payload": {"type": "thread_settings_applied"}},
+                {"timestamp": "2026-09-20T10:00:01Z", "type": "response_item",
+                 "payload": {"type": "message", "role": "user", "content": [
+                     {"type": "input_text",
+                      "text": "<environment_context>x</environment_context>"}]}},
+            ])
+            session = parse_codex_jsonl_file(path, iter_codex_jsonl_files([Path(tmp)])[0])
+            self.assertEqual(session["message_count"], 0)
+            self.assertEqual(session["agent_record_count"], 0)
+
+    def test_pasted_html_is_kept(self):
+        from claude_chat_search.codex_parser import _visible_user_text
+        self.assertEqual(_visible_user_text("<div>hello</div> why is this red?"),
+                         "<div>hello</div> why is this red?")
+
+
 if __name__ == "__main__":
     unittest.main()

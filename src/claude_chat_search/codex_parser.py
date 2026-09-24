@@ -2,8 +2,19 @@
 
 Codex's local JSONL format is not a documented public API.  Keep every format
 assumption in this module and cover it with fixtures.  Only visible user and
-agent messages are normalized; developer prompts, reasoning, tool calls, tool
-outputs, token counts, and world state are deliberately ignored.
+agent messages are normalized; developer prompts, injected context blocks,
+reasoning, tool calls, tool outputs, token counts, and world state are
+deliberately ignored.
+
+Three generations of the format are supported:
+
+* until early September 2026: ``event_msg`` records of type ``user_message`` /
+  ``agent_message`` carried exactly the visible conversation (such files also
+  contain ``response_item`` messages, which are then ignored);
+* since then: only ``response_item`` records of type ``message`` with role
+  ``user`` (``input_text`` blocks, mixed with injected context blocks) or
+  ``assistant`` (``output_text`` blocks);
+* the earliest rollouts: top-level ``message`` records.
 """
 
 from __future__ import annotations
@@ -157,6 +168,73 @@ def _legacy_content_text(content) -> str:
     return "\n".join(part for part in parts if part)
 
 
+# Context Codex injects into user-role messages.  Tags with "_" or "-" never
+# occur in HTML a user might paste, so any such fully wrapped block is treated
+# as injected; the others are listed explicitly.
+_INJECTED_TAGS = {"skill", "INSTRUCTIONS"}
+_WRAPPED_BLOCK = re.compile(r"<([A-Za-z][\w\-]*)(?:\s[^>]*)?>.*?</\1>\s*", re.DOTALL)
+_LONE_TAG = re.compile(r"</?[A-Za-z][\w\-]*(?:\s[^>\n]*)?>")
+_IDE_REQUEST_MARKER = "## My request for Codex:"
+
+
+def _is_injected_tag(tag: str) -> bool:
+    return tag in _INJECTED_TAGS or "_" in tag or "-" in tag
+
+
+def _visible_user_text(text: str) -> str:
+    """Strip Codex-injected context from one user input_text block."""
+    text = text.strip()
+    if text.startswith("# AGENTS.md instructions"):
+        return ""
+    if text.startswith("# Context from my IDE setup") and _IDE_REQUEST_MARKER in text:
+        text = text.split(_IDE_REQUEST_MARKER, 1)[1].strip()
+    while True:
+        match = _WRAPPED_BLOCK.match(text)
+        if not match or not _is_injected_tag(match.group(1)):
+            break
+        text = text[match.end():].lstrip()
+    # Image attachments arrive as bare "<image ...>" / "</image>" marker blocks.
+    if _LONE_TAG.fullmatch(text):
+        return ""
+    return text
+
+
+def _response_item_text(payload: dict) -> str:
+    role = payload.get("role")
+    content = payload.get("content")
+    if isinstance(content, str):
+        content = [{"type": "input_text" if role == "user" else "output_text", "text": content}]
+    if not isinstance(content, list):
+        return ""
+    wanted = "input_text" if role == "user" else "output_text"
+    parts = []
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != wanted:
+            continue
+        text = block.get("text") or ""
+        text = _visible_user_text(text) if role == "user" else text.strip()
+        if text:
+            parts.append(text)
+    return "\n\n".join(parts)
+
+
+_SETUP_EVENTS = {"thread_settings_applied", "user_message"}
+
+
+def _is_agent_activity(item: dict) -> bool:
+    item_type = item.get("type")
+    payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+    if item_type in {"turn_context", "world_state"}:
+        return False
+    if item_type == "event_msg":
+        return payload.get("type") not in _SETUP_EVENTS
+    if item_type == "response_item" and payload.get("type") == "message":
+        return payload.get("role") == "assistant"
+    if item_type == "message":
+        return item.get("role") == "assistant"
+    return item_type is not None
+
+
 def _normalized_message(role: str, text: str, timestamp: str | None) -> dict:
     """Return the small Claude-shaped message envelope consumed by chunker.py."""
     return {
@@ -178,7 +256,14 @@ def parse_codex_jsonl_file(filepath: Path, file_info: dict | None = None) -> dic
         "header": _read_header(filepath),
     }
     header = dict(file_info.get("header") or {})
-    messages = []
+    event_messages = []
+    response_messages = []
+    top_level_messages = []
+    # Records showing the agent took a turn.  A rollout holding only its
+    # session header and injected user/developer context (opened, never used)
+    # legitimately has no conversation; one with agent activity but no
+    # messages means the format has drifted.
+    agent_records = 0
 
     try:
         with filepath.open() as handle:
@@ -186,6 +271,8 @@ def parse_codex_jsonl_file(filepath: Path, file_info: dict | None = None) -> dic
                 try:
                     item = json.loads(line)
                 except json.JSONDecodeError:
+                    continue
+                if not isinstance(item, dict):
                     continue
 
                 item_type = item.get("type")
@@ -195,10 +282,9 @@ def parse_codex_jsonl_file(filepath: Path, file_info: dict | None = None) -> dic
                     header.setdefault("git_branch", (payload.get("git") or {}).get("branch"))
                     header.setdefault("session_started_at", payload.get("timestamp"))
                     continue
+                if _is_agent_activity(item):
+                    agent_records += 1
 
-                # Current Codex format: event_msg contains exactly what was visible
-                # in the conversation UI.  response_item and all tool/state records
-                # are intentionally excluded.
                 if item_type == "event_msg":
                     payload = item.get("payload") or {}
                     event_type = payload.get("type")
@@ -210,18 +296,36 @@ def parse_codex_jsonl_file(filepath: Path, file_info: dict | None = None) -> dic
                         continue
                     text = payload.get("message")
                     if isinstance(text, str) and text.strip():
-                        messages.append(_normalized_message(role, text.strip(), item.get("timestamp")))
+                        event_messages.append(
+                            _normalized_message(role, text.strip(), item.get("timestamp"))
+                        )
                     continue
 
-                # Very early Codex rollouts stored top-level message records.
+                # Only role user/assistant "message" items.  Developer messages,
+                # reasoning, tool calls/outputs and inter-agent "agent_message"
+                # items are other response_item payload types or roles.
+                if item_type == "response_item":
+                    payload = item.get("payload") or {}
+                    if payload.get("type") == "message" and payload.get("role") in {"user", "assistant"}:
+                        text = _response_item_text(payload)
+                        if text:
+                            response_messages.append(
+                                _normalized_message(payload["role"], text, item.get("timestamp"))
+                            )
+                    continue
+
                 if item_type == "message" and item.get("role") in {"user", "assistant"}:
                     text = _legacy_content_text(item.get("content"))
                     if text.strip():
-                        messages.append(
+                        top_level_messages.append(
                             _normalized_message(item["role"], text.strip(), item.get("timestamp"))
                         )
     except OSError:
-        messages = []
+        event_messages, response_messages, top_level_messages = [], [], []
+
+    # Rollouts that still write event_msg conversation also write the same
+    # turns as response_item messages; the event stream is the visible one.
+    messages = event_messages or response_messages or top_level_messages
 
     timestamps = [m["timestamp"] for m in messages if m.get("timestamp")]
     first_at = min(timestamps) if timestamps else header.get("session_started_at")
@@ -239,6 +343,7 @@ def parse_codex_jsonl_file(filepath: Path, file_info: dict | None = None) -> dic
         "first_message_at": first_at,
         "last_message_at": last_at,
         "message_count": len(messages),
+        "agent_record_count": agent_records,
         "files_touched": "[]",
         "tools_used": "[]",
         "commands_run": "[]",

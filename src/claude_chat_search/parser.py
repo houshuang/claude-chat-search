@@ -4,10 +4,11 @@ import re
 import subprocess
 from pathlib import Path
 
+from .paths import DATA_DIR
 
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
-GIT_REMOTE_CACHE_PATH = Path.home() / ".claude-chat-search" / "git-remotes.json"
-EXCLUDED_PROJECTS_PATH = Path.home() / ".claude-chat-search" / "excluded_projects.txt"
+GIT_REMOTE_CACHE_PATH = DATA_DIR / "git-remotes.json"
+EXCLUDED_PROJECTS_PATH = DATA_DIR / "excluded_projects.txt"
 
 _git_remote_cache: dict[str, str | None] | None = None
 
@@ -34,12 +35,47 @@ def load_excluded_projects() -> set[str]:
     }
 
 
-def is_excluded_project(project_path: str, excluded: set[str] | None = None) -> bool:
-    """True if project_path is an excluded path or lives under one."""
+def encode_project_path(path: str) -> str:
+    """Encode a path the way Claude Code names its ~/.claude/projects/ directories."""
+    return re.sub(r"[^A-Za-z0-9]", "-", path.rstrip("/"))
+
+
+def is_excluded_project(
+    project_path: str | None,
+    excluded: set[str] | None = None,
+    *,
+    cwd: str | None = None,
+    encoded_dir: str | None = None,
+) -> bool:
+    """True if a session belongs to an excluded path or lives under one.
+
+    decode_project_path() is lossy (every "-" becomes "/"), so a decoded
+    project_path never equals an excluded path containing a hyphen.  Match on
+    the transcript's recorded cwd when known, and on the encoded directory
+    name, which compares both sides in Claude's own (hyphenated) encoding.
+    The encoded prefix test also matches hyphenated siblings such as
+    /a/priv-other for /a/priv; over-excluding is the safe direction here.
+    """
     if excluded is None:
         excluded = load_excluded_projects()
-    path = project_path.rstrip("/")
-    return any(path == ex or path.startswith(ex + "/") for ex in excluded)
+    if not excluded:
+        return False
+    for path in (cwd, project_path):
+        if path:
+            path = path.rstrip("/")
+            if any(path == ex or path.startswith(ex + "/") for ex in excluded):
+                return True
+    encodings = []
+    if encoded_dir:
+        encodings.append(encoded_dir)
+    if project_path:
+        encodings.append(encode_project_path(project_path))
+    for enc in encodings:
+        for ex in excluded:
+            ex_enc = encode_project_path(ex)
+            if enc == ex_enc or enc.startswith(ex_enc + "-"):
+                return True
+    return False
 
 
 def iter_jsonl_files() -> list[dict]:
@@ -57,7 +93,7 @@ def iter_jsonl_files() -> list[dict]:
         if not project_dir.is_dir():
             continue
         project_path = decode_project_path(project_dir.name)
-        if is_excluded_project(project_path, excluded):
+        if is_excluded_project(project_path, excluded, encoded_dir=project_dir.name):
             continue
 
         for jsonl_file in sorted(project_dir.glob("*.jsonl")):
@@ -284,7 +320,7 @@ def file_info_from_path(transcript_path: str | Path) -> dict | None:
         return None
 
     project_path = decode_project_path(parts[0])
-    if is_excluded_project(project_path):
+    if is_excluded_project(project_path, encoded_dir=parts[0]):
         return None
     result = {
         "path": path,
