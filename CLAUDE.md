@@ -12,7 +12,8 @@ Semantic search over Claude Code and Codex conversations. Indexes JSONL conversa
 - `sources.py` — Source-neutral discovery/parser dispatch.
 - `chunker.py` — Splits conversations into searchable chunks.
 - `embedder.py` — Embeds chunks (384-dim model).
-- `vector_search.py` — NumPy-cached vector search (faster than sqlite-vec for large result sets).
+- `vector_search.py` — NumPy-cached vector search (faster than sqlite-vec for large result sets). The cache refreshes incrementally when `PRAGMA data_version` changes and filters by session before top-k.
+- `search_service.py` — Unix-socket search server run by the daemon (`search.sock` in the index directory, mode 0600) and the CLI client that falls back to in-process search.
 - `summarizer.py` — LLM-based topic summarization of sessions.
 - `cross_search.py` — Cross-index search across multiple chat indexes.
 - `search.py` also supports `expand=True` for LLM query expansion (lex/vec/hyde variants via limbic's `expand_query` + `multi_list_rrf`).
@@ -36,6 +37,8 @@ When deleting a session, delete children in FK-dependency order:
 4. `sessions`
 
 All session deletion goes through `delete_session_data()` in `db.py`. If you add a new table with a FK to sessions, you MUST update that function.
+
+Re-indexing a session goes through `sync_session_chunks()`, which matches stored chunks on (turn_number, `content_hash`), keeps matching rows and their vectors, deletes the rest (vectors first) and inserts only new chunks. `content_hash` is NULL on rows indexed before schema version 2 and is filled in the first time the session is re-indexed.
 
 ## Tech Stack
 

@@ -1,5 +1,7 @@
+import hashlib
 import os
 import struct
+from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,7 +25,7 @@ EMBEDDING_DIM = 384
 
 # Bump when init_db() gains a migration; init_db() is a no-op once the
 # database's user_version has reached it.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def _load_vec(conn: apsw.Connection) -> None:
@@ -272,12 +274,24 @@ def _migrate(conn: apsw.Connection) -> None:
         """CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
             INSERT INTO chunks_fts(chunks_fts, rowid, combined_text) VALUES('delete', old.id, old.combined_text);
         END""",
-        """CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON chunks BEGIN
-            INSERT INTO chunks_fts(chunks_fts, rowid, combined_text) VALUES('delete', old.id, old.combined_text);
-            INSERT INTO chunks_fts(rowid, combined_text) VALUES (new.id, new.combined_text);
-        END""",
     ]:
         conn.execute(trigger_sql)
+
+    # Only combined_text is indexed; marking a chunk embedded must not rewrite
+    # its FTS entry.
+    conn.execute("DROP TRIGGER IF EXISTS chunks_au")
+    conn.execute("""CREATE TRIGGER chunks_au AFTER UPDATE OF combined_text ON chunks BEGIN
+            INSERT INTO chunks_fts(chunks_fts, rowid, combined_text) VALUES('delete', old.id, old.combined_text);
+            INSERT INTO chunks_fts(rowid, combined_text) VALUES (new.id, new.combined_text);
+        END""")
+
+    try:
+        conn.execute("ALTER TABLE chunks ADD COLUMN content_hash TEXT")
+    except apsw.SQLError:
+        pass  # column already exists
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS chunks_session_idx ON chunks(session_id, embedded)"
+    )
 
     # Vec table
     try:
@@ -289,6 +303,19 @@ def _migrate(conn: apsw.Connection) -> None:
         """)
     except apsw.SQLError:
         pass  # already exists
+
+    # Vectors whose chunk is gone, and chunks marked embedded without a vector.
+    conn.execute(
+        "DELETE FROM vec_chunks WHERE chunk_id NOT IN (SELECT id FROM chunks)"
+    )
+    conn.execute(
+        "UPDATE chunks SET embedded = 0 WHERE embedded = 1 "
+        "AND id NOT IN (SELECT chunk_id FROM vec_chunks)"
+    )
+
+
+def chunk_hash(combined_text: str) -> str:
+    return hashlib.sha256(combined_text.encode("utf-8", "surrogatepass")).hexdigest()
 
 
 def serialize_embedding(embedding: list[float]) -> bytes:
@@ -367,8 +394,8 @@ def insert_chunks(conn: apsw.Connection, chunks: list[dict]) -> list[int]:
         conn.execute(
             """INSERT INTO chunks
                (session_id, user_content, assistant_content, combined_text,
-                timestamp, turn_number, token_estimate, embedded)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 0)""",
+                timestamp, turn_number, token_estimate, embedded, content_hash)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)""",
             (
                 chunk["session_id"],
                 chunk["user_content"],
@@ -377,6 +404,7 @@ def insert_chunks(conn: apsw.Connection, chunks: list[dict]) -> list[int]:
                 chunk.get("timestamp"),
                 chunk.get("turn_number"),
                 chunk.get("token_estimate", 0),
+                chunk_hash(chunk["combined_text"]),
             ),
         )
         row_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -406,6 +434,51 @@ def insert_embeddings(conn: apsw.Connection, chunk_ids: list[int], embeddings: l
     # Invalidate numpy search cache so it picks up new embeddings
     from .vector_search import invalidate_cache
     invalidate_cache()
+
+
+def sync_session_chunks(conn: apsw.Connection, session_id: str, chunks: list[dict]) -> dict:
+    """Make a session's stored chunks equal `chunks`, re-using unchanged rows.
+
+    Chunks are matched on (turn_number, content hash).  Matching rows keep
+    their id, FTS entry and vector; rows that no longer occur are deleted with
+    their vectors; only new or changed chunks are inserted, to be embedded
+    later.  Call inside write_transaction().
+    """
+    existing: dict[tuple, list[int]] = defaultdict(list)
+    missing_hash = []
+    for cid, turn, digest, text in conn.execute(
+        "SELECT id, turn_number, content_hash, "
+        "CASE WHEN content_hash IS NULL THEN combined_text END "
+        "FROM chunks WHERE session_id = ? ORDER BY id",
+        (session_id,),
+    ):
+        if digest is None:
+            digest = chunk_hash(text or "")
+            missing_hash.append((digest, cid))
+        existing[(turn, digest)].append(cid)
+
+    for digest, cid in missing_hash:
+        conn.execute("UPDATE chunks SET content_hash = ? WHERE id = ?", (digest, cid))
+
+    new_chunks = []
+    kept = 0
+    for chunk in chunks:
+        ids = existing.get((chunk.get("turn_number"), chunk_hash(chunk["combined_text"])))
+        if ids:
+            ids.pop(0)
+            kept += 1
+        else:
+            new_chunks.append(chunk)
+
+    stale = [cid for ids in existing.values() for cid in ids]
+    for cid in stale:
+        conn.execute("DELETE FROM vec_chunks WHERE chunk_id = ?", (cid,))
+        conn.execute("DELETE FROM chunks WHERE id = ?", (cid,))
+    insert_chunks(conn, new_chunks)
+    if stale:
+        from .vector_search import invalidate_cache
+        invalidate_cache()
+    return {"kept": kept, "deleted": len(stale), "inserted": len(new_chunks)}
 
 
 def delete_session_data(conn: apsw.Connection, session_id: str) -> None:
@@ -457,19 +530,37 @@ def _sanitize_fts_query(query: str) -> str:
     return FTS5Index._sanitize_query(query)
 
 
-def fts_search(conn: apsw.Connection, query: str, limit: int = 20) -> list[dict]:
+def fts_search(
+    conn: apsw.Connection, query: str, limit: int = 20,
+    session_filter: tuple[str, list] | None = None,
+) -> list[dict]:
+    """Rank chunks by FTS5 bm25.
+
+    session_filter is a (WHERE clause over sessions, bindings) pair; only
+    chunks of matching sessions are ranked.
+    """
     safe_query = _sanitize_fts_query(query)
     if not safe_query:
         return []
+    if session_filter is None:
+        sql = """SELECT rowid, rank
+                 FROM chunks_fts
+                 WHERE combined_text MATCH ?
+                 ORDER BY rank
+                 LIMIT ?"""
+        bindings = (safe_query, limit)
+    else:
+        where, params = session_filter
+        sql = f"""SELECT f.rowid, f.rank
+                  FROM chunks_fts f
+                  JOIN chunks c ON c.id = f.rowid
+                  WHERE f.combined_text MATCH ?
+                    AND c.session_id IN (SELECT session_id FROM sessions WHERE {where})
+                  ORDER BY f.rank
+                  LIMIT ?"""
+        bindings = (safe_query, *params, limit)
     try:
-        rows = list(conn.execute(
-            """SELECT rowid, rank
-               FROM chunks_fts
-               WHERE combined_text MATCH ?
-               ORDER BY rank
-               LIMIT ?""",
-            (safe_query, limit),
-        ))
+        rows = list(conn.execute(sql, bindings))
     except apsw.SQLError:
         # If FTS5 still fails on unusual input, return empty and let vector search carry
         return []

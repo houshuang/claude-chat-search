@@ -27,11 +27,11 @@ from .db import (
     get_subagents_for_session,
     get_topic_summary,
     init_db,
-    insert_chunks,
     insert_session,
     insert_subagent,
     integrity_check,
     prune_backups,
+    sync_session_chunks,
     update_session_fingerprint,
     update_session_git_remote,
 )
@@ -200,8 +200,33 @@ def _parse_date(value: str) -> str:
     return value
 
 
+# The first search after a daemon (re)start waits for the model to load.
+DAEMON_TIMEOUT = 30
+DAEMON_TIMEOUT_SLOW = 120
+
+
+def _hybrid_search(conn, query: str, limit: int, rerank: bool = False,
+                   expand: bool = False, **filters) -> tuple[list[dict], bool]:
+    """Hybrid search through the daemon, or in-process if it does not answer.
+
+    Returns (results, whether the daemon served them).
+    """
+    from .search_service import request
+
+    reply = request("search", {
+        "query": query, "limit": limit, "rerank": rerank, "expand": expand,
+        **filters,
+    }, timeout=DAEMON_TIMEOUT_SLOW if rerank or expand else DAEMON_TIMEOUT)
+    if reply is not None:
+        return reply["results"], True
+
+    from .search import hybrid_search
+    return hybrid_search(conn, query, limit=limit, do_rerank=rerank,
+                         expand=expand, **filters), False
+
+
 def _log_search(query: str, mode: str, results: list[dict], latency_ms: float,
-                 filters: dict | None = None):
+                 filters: dict | None = None, daemon: bool = False):
     """Append a JSON line to the search log with result details."""
     try:
         if is_excluded_project(os.getcwd()):
@@ -226,6 +251,8 @@ def _log_search(query: str, mode: str, results: list[dict], latency_ms: float,
     }
     if filters:
         entry["filters"] = filters
+    if daemon:
+        entry["daemon"] = True
     try:
         with open(DB_PATH.parent / "search.log", "a") as f:
             f.write(json.dumps(entry) + "\n")
@@ -253,7 +280,7 @@ def search(
     do_rerank, do_expand, source,
 ):
     """Search past conversations."""
-    from .search import file_search, grep_search, hybrid_search
+    from .search import file_search, grep_search
 
     conn = _read_connection()
 
@@ -262,6 +289,7 @@ def search(
     source_filter = None if source == "all" else source
 
     mode = "file" if file_mode else "grep" if grep_mode else "hybrid"
+    served_by_daemon = False
     t0 = _time.monotonic()
 
     if file_mode:
@@ -273,10 +301,11 @@ def search(
                               branch=branch, since=since_iso, before=before_iso,
                               source=source_filter)
     else:
-        results = hybrid_search(conn, query, limit=limit, project=project,
-                                branch=branch, since=since_iso, before=before_iso,
-                                do_rerank=do_rerank, expand=do_expand,
-                                source=source_filter)
+        results, served_by_daemon = _hybrid_search(
+            conn, query, limit=limit, project=project, branch=branch,
+            since=since_iso, before=before_iso, rerank=do_rerank,
+            expand=do_expand, source=source_filter,
+        )
 
     filters = {}
     if project:
@@ -290,7 +319,7 @@ def search(
     if source != "all":
         filters["source"] = source
     _log_search(query, mode, results, (_time.monotonic() - t0) * 1000,
-                filters or None)
+                filters or None, daemon=served_by_daemon)
 
     if not results:
         click.echo("No results found.")
@@ -731,9 +760,15 @@ def cross(query, limit, project, branch, since, before, do_expand):
     before_iso = _parse_date(before) if before else None
 
     t0 = _time.monotonic()
+    from .search_service import request
+    reply = request("cross_chat", {
+        "query": query, "limit": limit, "project": project, "branch": branch,
+        "since": since_iso, "before": before_iso, "expand": do_expand,
+    }, timeout=DAEMON_TIMEOUT_SLOW if do_expand else DAEMON_TIMEOUT)
+    chat = (reply["results"], reply["embedding"]) if reply else None
     results = cross_search(conn, query, limit=limit, project=project,
                            branch=branch, since=since_iso, before=before_iso,
-                           expand=do_expand)
+                           expand=do_expand, chat=chat)
     elapsed = (_time.monotonic() - t0) * 1000
 
     if not results:
@@ -821,15 +856,15 @@ def resume(query, limit, project, branch, since, before, do_fork):
     import os
     import shutil
 
-    from .search import hybrid_search
-
     conn = _read_connection()
 
     since_iso = _parse_date(since) if since else None
     before_iso = _parse_date(before) if before else None
 
-    results = hybrid_search(conn, query, limit=limit * 3, project=project,
-                            branch=branch, since=since_iso, before=before_iso)
+    results, _served = _hybrid_search(
+        conn, query, limit=limit * 3, project=project, branch=branch,
+        since=since_iso, before=before_iso,
+    )
 
     if not results:
         click.echo("No results found.")
@@ -1203,19 +1238,12 @@ def _run_index(conn, force: bool = False, source: str = "claude",
             session_data.update(metadata)
             chunks = create_chunks(session_data)
 
-            # Build the replacement completely before deleting the old data,
+            # Build the replacement completely before touching the old data,
             # then swap it inside one transaction.  A malformed active rollout
             # can never erase a previously indexed conversation.
-            saved_summary = get_topic_summary(conn, sid) if existing else None
             with write_transaction(conn):
-                if existing:
-                    delete_session_data(conn, sid)
                 insert_session(conn, session_data)
-                if saved_summary:
-                    from .db import update_topic_summary
-                    update_topic_summary(conn, sid, saved_summary)
-                if chunks:
-                    insert_chunks(conn, chunks)
+                sync_session_chunks(conn, sid, chunks)
 
             new_count += 1
 

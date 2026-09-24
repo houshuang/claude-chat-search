@@ -63,6 +63,8 @@ claude-chat-search index
 
 Only indexes new or modified sessions since the last run. Use `--all --force` to re-index everything from scratch.
 
+Re-indexing a changed session keeps every chunk whose turn number and text are unchanged, with its vector; only new or changed chunks are embedded. Chunks never exceed about 600 tokens: a paragraph longer than that is split at line breaks, then sentences, then words, and a long prompt gets chunks of its own. Sessions indexed before this rule can still hold much larger chunks; `index --force --source all` re-chunks them, and embeds only the chunks that change. (`reembed` recomputes vectors but keeps the chunks.)
+
 Use `--source claude`, `--source codex`, or `--source all` to select inputs. File mtime and size fingerprints are persisted in SQLite, so unchanged Codex scans do not parse multi-gigabyte rollout files.
 
 Codex's rollout format is undocumented and changes. If a Codex rollout in which the agent took a turn yields no messages, `index` prints a warning with the count; if every such rollout in the run yields nothing, `index` exits non-zero, which shows up as a failed run of the scheduled job.
@@ -88,9 +90,13 @@ Options:
 - `--before` — only results before date
 - `--grep` — exact substring search (skips semantic/FTS5, just matches raw text)
 - `--file` — search by file path mentioned in session tool calls
-- `--rerank` — re-score results with a cross-encoder for better relevance (slower, +5-15% accuracy)
+- `--rerank` — re-score the top 4 × `--limit` sessions with a cross-encoder, then keep `--limit` (slower, +5-15% accuracy)
 - `--expand` — LLM query expansion via Gemini Flash (needs `GEMINI_API_KEY`) for better recall on vague/cross-vocabulary queries (~3-5s extra, typically 3-5x score improvement). Generates keyword variants, semantic rephrases, and hypothetical document excerpts to bridge vocabulary gaps.
 - `--source` — limit results to `claude`, `codex`, or search `all` (default)
+
+Filters are applied while candidates are selected, in both the vector and the keyword ranking, so a narrow filter returns the best matches inside it rather than whatever survived a global top-k.
+
+When the daemon is running, `search`, `resume` and the chat half of `cross` are answered by it over a unix socket (`search.sock` in the index directory, mode 0600). It keeps the embedding model and all vectors in memory, so a search takes a fraction of a second instead of the 8–11 seconds a cold process needs to load them. Without a daemon the CLI searches in-process as before. Entries in `search.log` served by the daemon carry `"daemon": true`.
 
 ### Back up the index
 
@@ -256,10 +262,11 @@ Then Claude Code will search your past conversations when you ask things like "r
 - **sources.py** — dispatches source-specific discovery and parsing into the shared session/chunk model
 - **chunker.py** — splits conversations into user/assistant turn pairs with token-aware splitting and paragraph-boundary overlap
 - **embedder.py** — generates embeddings via [limbic](https://github.com/houshuang/limbic)'s `EmbeddingModel` (`paraphrase-multilingual-MiniLM-L12-v2`, local, multilingual, 384-dim)
-- **vector_search.py** — in-memory numpy vector search using limbic's `VectorIndex` with module-level caching
+- **vector_search.py** — in-memory numpy vector search, refreshed incrementally when the database changes, with session filters applied before top-k
 - **db.py** — SQLite with FTS5 for keyword search and `sqlite-vec` for vector storage
 - **search.py** — hybrid search (vector + keyword + grep + file) combined via Reciprocal Rank Fusion, deduplicated by session, with optional cross-encoder reranking and LLM query expansion (lex/vec/hyde variants) via limbic
-- **daemon.py** — persistent indexer daemon: queue-based incremental indexing with deferred retries, message-count skip, startup and hourly fingerprint scans
+- **daemon.py** — persistent indexer daemon: queue-based incremental indexing with deferred retries, message-count skip, startup and hourly fingerprint scans; also serves searches
+- **search_service.py** — the daemon's unix-socket search server and the CLI's client for it
 - **cli.py** — Click CLI exposing `init`, `index`, `search`, `resume`, `show`, `subagents`, `subagent`, `recover`, `reembed`, `summarize`, `cross`, `backup`, `exclude`, `purge-excluded`, and `daemon` commands
 
 `cross` (chat history plus a separate research-file index) and `summarize` (topic summaries) depend on the author's own tooling at fixed local paths and will not work on other machines as-is.
