@@ -98,6 +98,10 @@ Filters are applied while candidates are selected, in both the vector and the ke
 
 When the daemon is running, `search`, `resume` and the chat half of `cross` are answered by it over a unix socket (`search.sock` in the index directory, mode 0600). It keeps the embedding model and all vectors in memory, so a search takes a fraction of a second instead of the 8–11 seconds a cold process needs to load them. Without a daemon the CLI searches in-process as before. Entries in `search.log` served by the daemon carry `"daemon": true`.
 
+Right after the daemon starts it spends up to a minute on its startup scan and loading the model; until it is ready it answers "not ready" and the CLI searches in-process, so a search never hangs on a warming daemon. The daemon's copy of the vectors is refreshed at most every 30 seconds, so a chunk embedded in the last half minute may be missing from vector results (keyword search sees it at once).
+
+Measured on a 1 GB index (5.7k sessions, 72k chunks): 0.2–1.1 s per search through the daemon, about 0.35 s for a repeated query, against 8–11 s (p90 25 s) for a cold process.
+
 ### Back up the index
 
 ```bash
@@ -256,6 +260,9 @@ cp SKILL.md ~/.claude/skills/claude-chat-search/SKILL.md
 Then Claude Code will search your past conversations when you ask things like "remember when we discussed..." or "find that session where we fixed...".
 
 ## Architecture
+
+Several processes write to one SQLite database: the daemon, the Codex job, and manual `index` runs. Every write transaction starts with `BEGIN IMMEDIATE` (`db.write_transaction`), because a deferred transaction that reads before it writes fails at once when another process commits in between, without waiting for the busy timeout. Embedding happens outside any transaction, and the daemon's periodic WAL checkpoint is `PASSIVE`, so it never holds the write lock while waiting for readers.
+
 
 - **parser.py** — walks `~/.claude/projects/` and parses Claude Code JSONL conversation logs
 - **codex_parser.py** — isolates the undocumented Codex rollout format and normalizes only visible user/agent conversation
