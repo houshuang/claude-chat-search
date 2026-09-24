@@ -8,12 +8,16 @@ vanished are dropped.
 """
 
 import threading
+import time
 
 import numpy as np
 
 from .db import EMBEDDING_DIM
 
 _READ_BATCH = 500
+
+
+MIN_REFRESH_INTERVAL = 30.0
 
 
 class VectorCache:
@@ -31,6 +35,7 @@ class VectorCache:
         # connection, and a freed connection's id can be reused.
         self._conn = None
         self._stale = True
+        self._synced_at = 0.0
         self._lock = threading.Lock()
 
     def invalidate(self) -> None:
@@ -39,13 +44,15 @@ class VectorCache:
     def refresh(self, conn) -> None:
         with self._lock:
             version = conn.execute("PRAGMA data_version").fetchone()[0]
-            if (
-                not self._stale
-                and self._conn is conn
-                and self._data_version == version
-            ):
-                return
+            if not self._stale and self._conn is conn:
+                if self._data_version == version:
+                    return
+                # The hook writes on nearly every tool call; a search may see
+                # vectors up to MIN_REFRESH_INTERVAL old instead of re-syncing each time.
+                if time.monotonic() - self._synced_at < MIN_REFRESH_INTERVAL:
+                    return
             self._stale = False
+            self._synced_at = time.monotonic()
             self._conn = conn
             self._data_version = version
             self._sync(conn)
@@ -66,7 +73,11 @@ class VectorCache:
         by_id = np.argsort(ids, kind="stable")
         ids, sessions = ids[by_id], sessions[by_id]
 
-        old_ids, old_matrix, _ = self.state
+        old_ids, old_matrix, old_sessions = self.state
+        if len(old_ids) == len(ids) and np.array_equal(old_ids, ids):
+            if not np.array_equal(old_sessions, sessions):
+                self.state = (old_ids, old_matrix, sessions)
+            return
         keep = np.isin(old_ids, ids, assume_unique=True)
         known_ids, known_matrix = old_ids[keep], old_matrix[keep]
         wanted = ids[~np.isin(ids, known_ids, assume_unique=True)]
