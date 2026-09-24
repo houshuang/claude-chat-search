@@ -8,13 +8,15 @@ from pathlib import Path
 
 import click
 
-from .chunker import create_chunks
+from .chunker import create_chunks, resplit_stored_chunks
 from .db import (
     write_transaction,
     DB_PATH,
     _fetchall,
     backup_database,
     delete_session_data,
+    embedding_mismatch,
+    get_meta,
     get_connection,
     get_indexed_sessions,
     get_read_connection,
@@ -31,6 +33,7 @@ from .db import (
     insert_subagent,
     integrity_check,
     prune_backups,
+    set_meta,
     sync_session_chunks,
     update_session_fingerprint,
     update_session_git_remote,
@@ -75,10 +78,18 @@ def backup(destination, keep):
     # pending additive schema migration.
     conn = get_connection(readonly=True)
     try:
-        backup_path = backup_database(conn, destination)
+        backup_path = _checked_backup(conn, destination)
     finally:
         conn.close()
 
+    if keep is not None:
+        for removed in prune_backups(backup_path.parent, keep):
+            click.echo(f"Pruned: {removed}")
+
+
+def _checked_backup(conn, destination: Path | None = None) -> Path:
+    """Back up the index and verify the copy; raises ClickException if it is damaged."""
+    backup_path = backup_database(conn, destination)
     problems = integrity_check(backup_path)
     if problems:
         failed = backup_path.with_name(backup_path.name + ".failed-integrity")
@@ -97,10 +108,7 @@ def backup(destination, keep):
     click.echo(f"Backup: {backup_path}")
     click.echo("Integrity check: ok")
     click.echo(f"SHA-256: {digest.hexdigest()}")
-
-    if keep is not None:
-        for removed in prune_backups(backup_path.parent, keep):
-            click.echo(f"Pruned: {removed}")
+    return backup_path
 
 
 @cli.command()
@@ -138,14 +146,9 @@ def index(index_all, force, source):
         click.echo(f"Re-indexing {source} conversations from scratch...")
         if source == "all":
             # Drop and recreate vec table — sqlite-vec doesn't reclaim space on DELETE
-            conn.execute("DROP TABLE IF EXISTS vec_chunks")
-            from .db import EMBEDDING_DIM
-            conn.execute(f"""
-                CREATE VIRTUAL TABLE vec_chunks USING vec0(
-                    chunk_id INTEGER PRIMARY KEY,
-                    embedding FLOAT[{EMBEDDING_DIM}]
-                )
-            """)
+            from .db import migrate_vec_table
+            with write_transaction(conn):
+                migrate_vec_table(conn)
             conn.execute("PRAGMA foreign_keys=OFF")
             conn.execute("DELETE FROM chunks")
             conn.execute("DELETE FROM subagents")
@@ -306,6 +309,7 @@ def search(
             since=since_iso, before=before_iso, rerank=do_rerank,
             expand=do_expand, source=source_filter,
         )
+        _warn_if_semantic_limited(conn)
 
     filters = {}
     if project:
@@ -575,6 +579,18 @@ def subagent(session_id, agent_id, raw):
     conn.close()
 
 
+def _warn_if_semantic_limited(conn) -> None:
+    mismatch = embedding_mismatch(conn)
+    if mismatch:
+        click.echo(f"Warning: {mismatch}.", err=True)
+    elif get_meta(conn, "migration_state"):
+        stats = get_stats(conn)
+        click.echo(
+            f"Note: embedding migration in progress ({stats['embedded']}/{stats['chunks']} "
+            "chunks embedded); semantic results are incomplete.", err=True,
+        )
+
+
 def _read_connection():
     try:
         return get_read_connection()
@@ -684,9 +700,10 @@ def recover(session_id, turns):
 
 @cli.command()
 def reembed():
-    """Migrate to new embedding model: drop old vectors, re-embed all chunks."""
+    """Drop all vectors and re-embed every chunk with the configured model."""
     from .db import migrate_vec_table
     from .embedder import process_embeddings
+    from .models import configured_model
 
     conn = get_connection()
     init_db(conn)
@@ -694,20 +711,162 @@ def reembed():
     stats_before = get_stats(conn)
     click.echo(f"Before: {stats_before['chunks']} chunks, {stats_before['embedded']} embedded")
 
-    click.echo("Dropping old vec_chunks table and recreating with 384-dim...")
-    count = migrate_vec_table(conn)
+    spec = configured_model()
+    click.echo(f"Recreating vec_chunks at {spec.dim} dimensions...")
+    with write_transaction(conn):
+        count = migrate_vec_table(conn)
     click.echo(f"Marked {count} chunks for re-embedding.")
 
-    click.echo("Re-embedding all chunks with paraphrase-multilingual-MiniLM-L12-v2 (via limbic)...")
+    click.echo(f"Re-embedding all chunks with {spec.name}...")
 
     def progress(total):
         click.echo(f"  Embedded {total}/{count} chunks...", err=True)
 
-    total = process_embeddings(conn, callback=progress)
+    process_embeddings(conn, callback=progress)
 
     stats_after = get_stats(conn)
     click.echo(f"\nDone: {stats_after['embedded']}/{stats_after['chunks']} chunks embedded.")
     conn.close()
+
+
+MIGRATION_PROGRESS_EVERY = 250
+
+
+@cli.command("migrate-embeddings")
+@click.option("--no-backup", is_flag=True, help="Skip the backup taken before the first change")
+def migrate_embeddings(no_backup):
+    """Re-chunk every session and re-embed the index with the configured model.
+
+    Safe to interrupt and run again: it resumes where it stopped.  Keyword
+    search keeps working throughout.  Until the switch to the new vector
+    table, semantic search is off (the stored vectors are from the old
+    model); after it, semantic search covers the chunks embedded so far.
+    Sessions whose transcript is gone keep their stored text, re-split to
+    the current chunk size.
+    """
+    from .db import get_unembedded_chunks, migrate_vec_table
+    from .embedder import EmbeddingUnavailable, embed_rows, embedding_lock
+    from .models import configured_model
+
+    spec = configured_model()
+    conn = get_connection()
+    init_db(conn)
+    state = get_meta(conn, "migration_state")
+    target = get_meta(conn, "migration_model")
+
+    if state is None:
+        if embedding_mismatch(conn) is None:
+            click.echo(f"The index already uses {spec.name}; nothing to migrate.")
+            conn.close()
+            return
+        if not no_backup:
+            _checked_backup(conn)
+        with write_transaction(conn):
+            set_meta(conn, "migration_state", "rechunk")
+            set_meta(conn, "migration_model", spec.name)
+            set_meta(conn, "migration_cursor", "")
+        state, target = "rechunk", spec.name
+    elif target != spec.name:
+        raise click.ClickException(
+            f"A migration to {target} is in progress but {spec.name} is configured; "
+            f"set CLAUDE_CHAT_SEARCH_MODEL={target} to finish it"
+        )
+    click.echo(f"Migrating to {spec.name} ({spec.dim} dimensions)")
+
+    if state == "rechunk":
+        _rechunk_all_sessions(conn)
+        with write_transaction(conn):
+            count = migrate_vec_table(conn)
+            set_meta(conn, "migration_state", "embed")
+            set_meta(conn, "migration_cursor", None)
+        click.echo(f"Switched to the new vector table; {count} chunks to embed.")
+
+    started = _time.monotonic()
+    done = 0
+    while True:
+        with embedding_lock() as acquired:
+            if acquired:
+                while rows := get_unembedded_chunks(conn, 256):
+                    try:
+                        stored, _skipped = embed_rows(conn, rows)
+                    except EmbeddingUnavailable as error:
+                        raise click.ClickException(
+                            f"{error}; run migrate-embeddings again to resume"
+                        )
+                    done += stored
+                    left = conn.execute(
+                        "SELECT COUNT(*) FROM chunks WHERE embedded = 0"
+                    ).fetchone()[0]
+                    rate = done / max(_time.monotonic() - started, 1e-9)
+                    click.echo(
+                        f"  embedded {done}, {left} left "
+                        f"({rate:.1f} chunks/s, ~{left / max(rate, 1e-9) / 60:.0f} min)",
+                        err=True,
+                    )
+        if not conn.execute("SELECT 1 FROM chunks WHERE embedded = 0 LIMIT 1").fetchone():
+            break
+        # The daemon holds the embedding lock for a pass of its own.
+        _time.sleep(5)
+
+    with write_transaction(conn):
+        set_meta(conn, "migration_state", None)
+        set_meta(conn, "migration_model", None)
+    stats = get_stats(conn)
+    failed = conn.execute("SELECT COUNT(*) FROM chunks WHERE embedded = -1").fetchone()[0]
+    click.echo(
+        f"Done: {stats['sessions']} sessions, {stats['embedded']}/{stats['chunks']} chunks "
+        f"embedded with {spec.name}" + (f"; {failed} could not be embedded" if failed else "")
+    )
+    conn.close()
+
+
+def _rechunk_all_sessions(conn) -> None:
+    """Re-chunk every session after the stored cursor, one transaction each."""
+    files = {f["session_id"]: f for f in iter_conversation_files("all")}
+    excluded = load_excluded_projects()
+    cursor = get_meta(conn, "migration_cursor") or ""
+    session_ids = [row[0] for row in conn.execute(
+        "SELECT session_id FROM sessions WHERE session_id > ? ORDER BY session_id",
+        (cursor,),
+    )]
+    now = datetime.now(timezone.utc).isoformat()
+    from_transcript = from_stored = 0
+    for n, sid in enumerate(session_ids, 1):
+        session_data, chunks = _rechunk_from_transcript(files.get(sid), excluded, now)
+        if session_data is None:
+            chunks = resplit_stored_chunks(_fetchall(
+                conn, "SELECT * FROM chunks WHERE session_id = ? ORDER BY id", (sid,)
+            ))
+            from_stored += 1
+        else:
+            from_transcript += 1
+        with write_transaction(conn):
+            if session_data is not None:
+                insert_session(conn, session_data)
+            sync_session_chunks(conn, sid, chunks)
+            set_meta(conn, "migration_cursor", sid)
+        if n % MIGRATION_PROGRESS_EVERY == 0 or n == len(session_ids):
+            click.echo(f"  re-chunked {n}/{len(session_ids)} sessions", err=True)
+    click.echo(
+        f"Re-chunked {from_transcript} sessions from transcripts and "
+        f"{from_stored} from stored text (transcript gone)", err=True,
+    )
+
+
+def _rechunk_from_transcript(file_info, excluded, now):
+    """(session_data, chunks) parsed from the transcript, or (None, None) to keep stored text."""
+    if file_info is None:
+        return None, None
+    try:
+        session_data = parse_conversation_file(file_info)
+    except Exception as error:
+        click.echo(f"\nError parsing {file_info['path']}: {error}", err=True)
+        return None, None
+    if not session_data["messages"] or is_excluded_project(
+        file_info["project_path"], excluded, cwd=session_data.get("cwd")
+    ):
+        return None, None
+    return session_data, _prepare_session(session_data, file_info, now)
 
 
 @cli.command()
@@ -769,6 +928,7 @@ def cross(query, limit, project, branch, since, before, do_expand):
     results = cross_search(conn, query, limit=limit, project=project,
                            branch=branch, since=since_iso, before=before_iso,
                            expand=do_expand, chat=chat)
+    _warn_if_semantic_limited(conn)
     elapsed = (_time.monotonic() - t0) * 1000
 
     if not results:
@@ -1222,21 +1382,7 @@ def _run_index(conn, force: bool = False, source: str = "claude",
                     _purge_sessions(conn, [sid])
                 continue
 
-            session_data["project_path"] = (
-                session_data.get("cwd") or file_info["project_path"]
-            )
-            session_data["indexed_at"] = now
-            session_data["parent_session_id"] = file_info.get("parent_session_id")
-            session_data["source"] = file_info.get("source", "claude")
-            session_data["native_session_id"] = file_info.get("native_session_id", sid)
-            session_data["thread_kind"] = file_info.get("thread_kind", "user")
-            session_data["transcript_path"] = str(file_info["path"])
-            session_data["transcript_mtime"] = file_info.get("mtime")
-            session_data["transcript_size"] = file_info.get("size")
-
-            metadata = extract_conversation_metadata(session_data)
-            session_data.update(metadata)
-            chunks = create_chunks(session_data)
+            chunks = _prepare_session(session_data, file_info, now)
 
             # Build the replacement completely before touching the old data,
             # then swap it inside one transaction.  A malformed active rollout
@@ -1312,6 +1458,26 @@ def _run_index(conn, force: bool = False, source: str = "claude",
         click.echo(f"Indexed {sub_count} subagent metadata records", err=True)
 
     return new_count
+
+
+def _prepare_session(session_data: dict, file_info: dict, now: str) -> list[dict]:
+    """Fill in a parsed session's index fields and return its chunks."""
+    sid = file_info["session_id"]
+    session_data["project_path"] = (
+        session_data.get("cwd") or file_info["project_path"]
+    )
+    session_data["indexed_at"] = now
+    session_data["parent_session_id"] = file_info.get("parent_session_id")
+    session_data["source"] = file_info.get("source", "claude")
+    session_data["native_session_id"] = file_info.get("native_session_id", sid)
+    session_data["thread_kind"] = file_info.get("thread_kind", "user")
+    session_data["transcript_path"] = str(file_info["path"])
+    session_data["transcript_mtime"] = file_info.get("mtime")
+    session_data["transcript_size"] = file_info.get("size")
+
+    metadata = extract_conversation_metadata(session_data)
+    session_data.update(metadata)
+    return create_chunks(session_data)
 
 
 def _run_embed(conn) -> int:

@@ -149,7 +149,7 @@ class SearchService:
     def _cross_chat(conn, query, **kwargs):
         from .cross_search import chat_candidates
         from .embedder import embed_query
-        embedding = embed_query(query)
+        embedding = embed_query(query) if db.embedding_mismatch(conn) is None else None
         return chat_candidates(conn, query, embedding, **kwargs), embedding
 
     def close(self) -> None:

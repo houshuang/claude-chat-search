@@ -221,45 +221,102 @@ def create_chunks(session_data: dict) -> list[dict]:
                 "token_estimate": token_count,
             })
         else:
-            user_text = turn["user_text"]
-            user_tokens = count_tokens(f"User: {user_text}\n\n")
-            if user_tokens > MAX_USER_PREFIX_TOKENS:
-                # A long prompt (a pasted document or log) gets chunks of its
-                # own; the assistant parts carry only its opening.
-                for part in split_text_at_paragraphs(user_text, MAX_CHUNK_TOKENS - 10):
-                    part_combined = f"User: {part}"
-                    chunks.append({
-                        "session_id": session_id,
-                        "user_content": part,
-                        "assistant_content": "",
-                        "combined_text": part_combined,
-                        "timestamp": turn["timestamp"],
-                        "turn_number": turn["turn_number"],
-                        "token_estimate": count_tokens(part_combined),
-                    })
-                user_text = split_oversized(user_text, MAX_USER_PREFIX_TOKENS - 10)[0]
-                user_tokens = count_tokens(f"User: {user_text}\n\n")
-            available = MAX_CHUNK_TOKENS - user_tokens - 5
-
-            # Include tool summary in the first split part
             text_to_split = turn["assistant_text"]
             if turn["tool_summary"]:
                 text_to_split += f"\n{turn['tool_summary']}"
-
-            parts = split_text_at_paragraphs(text_to_split, available) if text_to_split.strip() else []
-            for part in parts:
-                part_combined = f"User: {user_text}\n\nAssistant: {part}"
-                chunks.append({
-                    "session_id": session_id,
-                    "user_content": user_text,
-                    "assistant_content": part,
-                    "combined_text": part_combined,
-                    "timestamp": turn["timestamp"],
-                    "turn_number": turn["turn_number"],
-                    "token_estimate": count_tokens(part_combined),
-                })
+            chunks.extend(_split_turn(
+                session_id, turn["user_text"], text_to_split,
+                turn["timestamp"], turn["turn_number"],
+            ))
 
     return chunks
+
+
+def _split_turn(session_id: str, user_text: str, text_to_split: str,
+                timestamp, turn_number) -> list[dict]:
+    """Chunks for one turn too long for a single chunk.
+
+    text_to_split is the assistant text with its tool summary appended.
+    """
+    chunks = []
+    user_tokens = count_tokens(f"User: {user_text}\n\n")
+    if user_tokens > MAX_USER_PREFIX_TOKENS:
+        # A long prompt (a pasted document or log) gets chunks of its
+        # own; the assistant parts carry only its opening.
+        for part in split_text_at_paragraphs(user_text, MAX_CHUNK_TOKENS - 10):
+            part_combined = f"User: {part}"
+            chunks.append({
+                "session_id": session_id,
+                "user_content": part,
+                "assistant_content": "",
+                "combined_text": part_combined,
+                "timestamp": timestamp,
+                "turn_number": turn_number,
+                "token_estimate": count_tokens(part_combined),
+            })
+        user_text = split_oversized(user_text, MAX_USER_PREFIX_TOKENS - 10)[0]
+        user_tokens = count_tokens(f"User: {user_text}\n\n")
+    available = MAX_CHUNK_TOKENS - user_tokens - 5
+
+    parts = split_text_at_paragraphs(text_to_split, available) if text_to_split.strip() else []
+    for part in parts:
+        part_combined = f"User: {user_text}\n\nAssistant: {part}"
+        chunks.append({
+            "session_id": session_id,
+            "user_content": user_text,
+            "assistant_content": part,
+            "combined_text": part_combined,
+            "timestamp": timestamp,
+            "turn_number": turn_number,
+            "token_estimate": count_tokens(part_combined),
+        })
+    return chunks
+
+
+def resplit_stored_chunks(rows: list[dict]) -> list[dict]:
+    """Apply the current size limit to chunks read back from the index.
+
+    For sessions whose transcript no longer exists, the stored chunks are the
+    only copy of the conversation.  Chunks within MAX_CHUNK_TOKENS are kept as
+    they are; longer ones (written by an older chunker) are split the way
+    create_chunks() splits a long turn.  An older chunker repeated a long
+    prompt in every part of its turn, so identical parts of one turn are
+    kept once.
+    """
+    out = []
+    seen = set()
+    for row in rows:
+        combined = row["combined_text"] or ""
+        chunk = {
+            "session_id": row["session_id"],
+            "user_content": row["user_content"] or "",
+            "assistant_content": row["assistant_content"] or "",
+            "combined_text": combined,
+            "timestamp": row.get("timestamp"),
+            "turn_number": row.get("turn_number"),
+            "token_estimate": row.get("token_estimate") or 0,
+        }
+        tokens = count_tokens(combined)
+        if tokens <= MAX_CHUNK_TOKENS:
+            chunk["token_estimate"] = tokens
+            out.append(chunk)
+            continue
+        user_text = chunk["user_content"]
+        prefix = f"User: {user_text}\n\nAssistant: "
+        if combined.startswith(prefix):
+            rest = combined[len(prefix):]
+        elif combined.startswith(f"User: {user_text}"):
+            rest = combined[len(f"User: {user_text}"):].lstrip()
+        else:
+            user_text, rest = "", combined
+        for part in _split_turn(
+            chunk["session_id"], user_text, rest, chunk["timestamp"], chunk["turn_number"],
+        ):
+            key = (part["turn_number"], part["combined_text"])
+            if key not in seen:
+                seen.add(key)
+                out.append(part)
+    return out
 
 
 def _merge_tiny_turns(turns: list[dict]) -> list[dict]:

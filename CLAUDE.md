@@ -1,6 +1,6 @@
 # claude-chat-search
 
-Semantic search over Claude Code and Codex conversations. Indexes JSONL conversation files, chunks them, embeds with a 384-dim model, and stores in SQLite with sqlite-vec for vector search + FTS5 for text search.
+Semantic search over Claude Code and Codex conversations. Indexes JSONL conversation files, chunks them, embeds with a local sentence-transformers model (`models.py`), and stores in SQLite with sqlite-vec for vector search + FTS5 for text search.
 
 ## Architecture
 
@@ -11,7 +11,8 @@ Semantic search over Claude Code and Codex conversations. Indexes JSONL conversa
 - `codex_parser.py` — Parses only visible conversation from Codex rollout files; excludes system/developer prompts, reasoning, tools, outputs, state, and subagent rollouts.
 - `sources.py` — Source-neutral discovery/parser dispatch.
 - `chunker.py` — Splits conversations into searchable chunks.
-- `embedder.py` — Embeds chunks (384-dim model).
+- `models.py` — Embedding model specs (name, dim, max tokens, query/document prompts); `CLAUDE_CHAT_SEARCH_MODEL` overrides the default.
+- `embedder.py` — Embeds chunks and queries with the configured model.
 - `vector_search.py` — NumPy-cached vector search (faster than sqlite-vec for large result sets). The cache refreshes incrementally when `PRAGMA data_version` changes and filters by session before top-k.
 - `search_service.py` — Unix-socket search server run by the daemon (`search.sock` in the index directory, mode 0600) and the CLI client that falls back to in-process search.
 - `summarizer.py` — LLM-based topic summarization of sessions.
@@ -20,7 +21,9 @@ Semantic search over Claude Code and Codex conversations. Indexes JSONL conversa
 
 ## DB Schema (index.db in ~/.claude-chat-search/, or $CLAUDE_CHAT_SEARCH_HOME)
 
-Tables: `sessions`, `subagents`, `chunks`, `chunks_fts` (FTS5), `vec_chunks` (sqlite-vec).
+Tables: `sessions`, `subagents`, `chunks`, `chunks_fts` (FTS5), `vec_chunks` (sqlite-vec), `meta` (key/value).
+
+`meta.embedding_model` / `embedding_dim` record the model behind `vec_chunks`. Never write vectors from another model into it: `db.embedding_mismatch()` is checked before every vector search and embedding pass, which fall back to FTS-only / skip on a mismatch. `migrate-embeddings` is the only way to change models; its progress is in `meta.migration_state` (`rechunk`, then `embed`), `migration_model` and `migration_cursor`.
 
 Codex sessions use namespaced internal IDs (`codex:<native-id>`) and retain the native ID in `sessions.native_session_id`. Since September 2026 Codex rollouts carry the conversation only as `response_item` records of type `message`; `codex_parser.py` takes role `user` `input_text` (stripped of injected AGENTS.md / `<environment_context>` / other wrapped context blocks) and role `assistant` `output_text`, and nothing else. Never feed other `response_item` types (reasoning, tool calls and outputs, inter-agent `agent_message`) or developer messages into chunks. Older rollouts that still have `event_msg` `user_message`/`agent_message` are read from those instead.
 

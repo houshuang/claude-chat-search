@@ -35,7 +35,7 @@ uv venv && uv pip install -e .
 source .venv/bin/activate   # puts claude-chat-search on your PATH
 ```
 
-Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/). Indexing, keyword, semantic and reranked search run locally with no API keys. The first run downloads the embedding model (about 460 MB). Only `--expand` calls an LLM (Gemini Flash, needs `GEMINI_API_KEY`).
+Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/). Indexing, keyword, semantic and reranked search run locally with no API keys. The first run downloads the embedding model (about 630 MB). Only `--expand` calls an LLM (Gemini Flash, needs `GEMINI_API_KEY`).
 
 ## Usage
 
@@ -45,7 +45,7 @@ Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/). Indexing, keyword, s
 claude-chat-search init
 ```
 
-Creates the database at `~/.claude-chat-search/index.db`, indexes all existing conversations, and generates embeddings using a local model (`paraphrase-multilingual-MiniLM-L12-v2`, 384-dim).
+Creates the database at `~/.claude-chat-search/index.db`, indexes all existing conversations, and generates embeddings using a local model (`ibm-granite/granite-embedding-311m-multilingual-r2`, 768-dim, reads up to 1024 tokens per chunk). See [Embedding model](#embedding-model).
 
 Set `CLAUDE_CHAT_SEARCH_HOME` to keep the index, queue, logs, exclusion list and backups somewhere other than `~/.claude-chat-search` (useful for tests and throwaway copies). `CHAT_SEARCH_DB_PATH` still overrides the database file alone.
 
@@ -63,7 +63,7 @@ claude-chat-search index
 
 Only indexes new or modified sessions since the last run. Use `--all --force` to re-index everything from scratch.
 
-Re-indexing a changed session keeps every chunk whose turn number and text are unchanged, with its vector; only new or changed chunks are embedded. Chunks never exceed about 600 tokens: a paragraph longer than that is split at line breaks, then sentences, then words, and a long prompt gets chunks of its own. Sessions indexed before this rule can still hold much larger chunks; `index --force --source all` re-chunks them, and embeds only the chunks that change. (`reembed` recomputes vectors but keeps the chunks.)
+Re-indexing a changed session keeps every chunk whose turn number and text are unchanged, with its vector; only new or changed chunks are embedded. Chunks never exceed about 600 tokens: a paragraph longer than that is split at line breaks, then sentences, then words, and a long prompt gets chunks of its own. Sessions indexed before this rule can still hold much larger chunks; `migrate-embeddings` re-chunks them (see below), including sessions whose transcript is no longer on disk. (`reembed` recomputes vectors but keeps the chunks.)
 
 Use `--source claude`, `--source codex`, or `--source all` to select inputs. File mtime and size fingerprints are persisted in SQLite, so unchanged Codex scans do not parse multi-gigabyte rollout files.
 
@@ -100,7 +100,21 @@ When the daemon is running, `search`, `resume` and the chat half of `cross` are 
 
 Right after the daemon starts it spends up to a minute on its startup scan and loading the model; until it is ready it answers "not ready" and the CLI searches in-process, so a search never hangs on a warming daemon. The daemon's copy of the vectors is refreshed at most every 30 seconds, so a chunk embedded in the last half minute may be missing from vector results (keyword search sees it at once).
 
-Measured on a 1 GB index (5.7k sessions, 72k chunks): 0.2–1.1 s per search through the daemon, about 0.35 s for a repeated query, against 8–11 s (p90 25 s) for a cold process.
+Measured on a 1.4 GB index (5.7k sessions, 114k chunks, granite-311m): median 0.2 s and p90 0.37 s per search through the daemon, against 8–11 s (p90 25 s) for a cold process.
+
+### Embedding model
+
+The index records which model produced its vectors (the `meta` table). A query is only ever compared with vectors from the model that embeds it: if the stored model differs from the configured one, `search`, `resume` and `cross` fall back to keyword search and print a warning, and nothing new is embedded until the index is migrated.
+
+The default is `ibm-granite/granite-embedding-311m-multilingual-r2` (Apache 2.0, 311M parameters, 768 dimensions, run in float16 on Apple GPUs). It replaced `paraphrase-multilingual-MiniLM-L12-v2`, which reads only the first 128 tokens of a chunk, after a September 2026 comparison on 53 known-answer queries (English, Norwegian and cross-lingual) against the author's history: session-level MRR of the full hybrid search went from 0.52 to 0.65 and recall@10 from 0.83 to 0.98. Of the larger models, bge-m3 ranked slightly higher on one test pool but would take about 4.5 hours to embed the index; Qwen3-Embedding-0.6B, embeddinggemma-300m and multilingual-e5-large ranked no better and would take 2.5–10 hours. Models are listed in `models.py`; `CLAUDE_CHAT_SEARCH_MODEL` selects another one from that list (for example `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`, the model used before September 2026).
+
+To move an index to the configured model:
+
+```bash
+claude-chat-search migrate-embeddings
+```
+
+It backs up the index, re-chunks every session with the current chunker (from the transcript when it still exists, otherwise from the stored text, re-split to the current chunk size), recreates the vector table at the new width and embeds every chunk. It is safe to interrupt and run again; it resumes where it stopped. The daemon can keep running: keyword search works throughout. Until the switch to the new vector table (after re-chunking) semantic search is off; after it, semantic search covers the chunks embedded so far and a note says the migration is in progress. `--no-backup` skips the backup. On the author's machine (Apple M4 Pro, 5,800 sessions, 114,000 chunks after re-chunking) it took 100 minutes: three minutes of re-chunking, the rest embedding at about 20 chunks a second. The index grew from 1.1 to 1.4 GB.
 
 ### Back up the index
 
@@ -268,12 +282,13 @@ Several processes write to one SQLite database: the daemon, the Codex job, and m
 - **codex_parser.py** — isolates the undocumented Codex rollout format and normalizes only visible user/agent conversation
 - **sources.py** — dispatches source-specific discovery and parsing into the shared session/chunk model
 - **chunker.py** — splits conversations into user/assistant turn pairs with token-aware splitting and paragraph-boundary overlap
-- **embedder.py** — generates embeddings via [limbic](https://github.com/houshuang/limbic)'s `EmbeddingModel` (`paraphrase-multilingual-MiniLM-L12-v2`, local, multilingual, 384-dim)
+- **models.py** — the embedding models the index can be built with, their widths, token limits and query/document prompts
+- **embedder.py** — embeds chunks and queries locally with sentence-transformers (default `ibm-granite/granite-embedding-311m-multilingual-r2`)
 - **vector_search.py** — in-memory numpy vector search, refreshed incrementally when the database changes, with session filters applied before top-k
 - **db.py** — SQLite with FTS5 for keyword search and `sqlite-vec` for vector storage
 - **search.py** — hybrid search (vector + keyword + grep + file) combined via Reciprocal Rank Fusion, deduplicated by session, with optional cross-encoder reranking and LLM query expansion (lex/vec/hyde variants) via limbic
 - **daemon.py** — persistent indexer daemon: queue-based incremental indexing with deferred retries, message-count skip, startup and hourly fingerprint scans; also serves searches
 - **search_service.py** — the daemon's unix-socket search server and the CLI's client for it
-- **cli.py** — Click CLI exposing `init`, `index`, `search`, `resume`, `show`, `subagents`, `subagent`, `recover`, `reembed`, `summarize`, `cross`, `backup`, `exclude`, `purge-excluded`, and `daemon` commands
+- **cli.py** — Click CLI exposing `init`, `index`, `search`, `resume`, `show`, `subagents`, `subagent`, `recover`, `reembed`, `migrate-embeddings`, `summarize`, `cross`, `backup`, `exclude`, `purge-excluded`, and `daemon` commands
 
 `cross` (chat history plus a separate research-file index) and `summarize` (topic summaries) depend on the author's own tooling at fixed local paths and will not work on other machines as-is.

@@ -9,6 +9,7 @@ from pathlib import Path
 import apsw
 import sqlite_vec
 
+from .models import LEGACY_MODEL, MODELS, configured_model
 from .paths import DATA_DIR
 
 BUSY_TIMEOUT_MS = 30000
@@ -20,12 +21,16 @@ DB_PATH = (
     else DATA_DIR / "index.db"
 )
 DB_DIR = DB_PATH.parent
-EMBEDDING_DIM = 384
 
 
 # Bump when init_db() gains a migration; init_db() is a no-op once the
 # database's user_version has reached it.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+
+def embedding_dim() -> int:
+    """Vector width of the configured embedding model."""
+    return configured_model().dim
 
 
 def _load_vec(conn: apsw.Connection) -> None:
@@ -293,16 +298,15 @@ def _migrate(conn: apsw.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS chunks_session_idx ON chunks(session_id, embedded)"
     )
 
-    # Vec table
-    try:
-        conn.execute(f"""
-            CREATE VIRTUAL TABLE vec_chunks USING vec0(
-                chunk_id INTEGER PRIMARY KEY,
-                embedding FLOAT[{EMBEDDING_DIM}]
-            )
-        """)
-    except apsw.SQLError:
-        pass  # already exists
+    conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+    had_vectors = _table_exists(conn, "vec_chunks")
+    if not had_vectors:
+        _create_vec_table(conn, embedding_dim())
+    if get_meta(conn, "embedding_model") is None:
+        # Every index built before the meta table used the legacy model.
+        model = LEGACY_MODEL if had_vectors else configured_model().name
+        set_meta(conn, "embedding_model", model)
+        set_meta(conn, "embedding_dim", str(MODELS[model].dim))
 
     # Vectors whose chunk is gone, and chunks marked embedded without a vector.
     conn.execute(
@@ -311,6 +315,57 @@ def _migrate(conn: apsw.Connection) -> None:
     conn.execute(
         "UPDATE chunks SET embedded = 0 WHERE embedded = 1 "
         "AND id NOT IN (SELECT chunk_id FROM vec_chunks)"
+    )
+
+
+def _table_exists(conn: apsw.Connection, name: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE name = ?", (name,)
+    ).fetchone() is not None
+
+
+def _create_vec_table(conn: apsw.Connection, dim: int) -> None:
+    conn.execute(f"""
+        CREATE VIRTUAL TABLE vec_chunks USING vec0(
+            chunk_id INTEGER PRIMARY KEY,
+            embedding FLOAT[{dim}]
+        )
+    """)
+
+
+def get_meta(conn: apsw.Connection, key: str) -> str | None:
+    if not _table_exists(conn, "meta"):
+        return None
+    row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def set_meta(conn: apsw.Connection, key: str, value: str | None) -> None:
+    if value is None:
+        conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+    else:
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+
+
+def stored_embedding_model(conn: apsw.Connection) -> str | None:
+    """The model that produced the vectors in vec_chunks."""
+    return get_meta(conn, "embedding_model")
+
+
+def embedding_mismatch(conn: apsw.Connection) -> str | None:
+    """Why stored vectors cannot be searched with the configured model, or None."""
+    stored = stored_embedding_model(conn)
+    configured = configured_model().name
+    if stored == configured:
+        return None
+    return (
+        f"the index holds vectors from {stored or 'an unknown model'} but "
+        f"{configured} is configured; semantic search is off until "
+        "`claude-chat-search migrate-embeddings` has run (keyword search still works)"
     )
 
 
@@ -789,18 +844,16 @@ def update_session_git_remote(conn: apsw.Connection, project_path: str, git_remo
 
 
 def migrate_vec_table(conn: apsw.Connection) -> int:
-    """Drop old vec_chunks table, recreate with current EMBEDDING_DIM, mark all chunks for re-embedding.
+    """Recreate vec_chunks for the configured model and mark every chunk for embedding.
 
-    Returns the number of chunks marked for re-embedding.
+    Call inside write_transaction().  Returns the number of chunks marked.
     """
+    spec = configured_model()
     conn.execute("DROP TABLE IF EXISTS vec_chunks")
-    conn.execute(f"""
-        CREATE VIRTUAL TABLE vec_chunks USING vec0(
-            chunk_id INTEGER PRIMARY KEY,
-            embedding FLOAT[{EMBEDDING_DIM}]
-        )
-    """)
+    _create_vec_table(conn, spec.dim)
     conn.execute("UPDATE chunks SET embedded = 0")
+    set_meta(conn, "embedding_model", spec.name)
+    set_meta(conn, "embedding_dim", str(spec.dim))
     from .vector_search import invalidate_cache
     invalidate_cache()
     return conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]

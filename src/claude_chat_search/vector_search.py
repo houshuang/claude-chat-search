@@ -1,10 +1,10 @@
 """Brute-force vector search over an in-memory copy of vec_chunks.
 
-At ~70K chunks with 384-dim vectors a numpy dot product takes a few
-milliseconds, faster than sqlite-vec for large result sets.  The copy is
-refreshed incrementally: when the database has changed (PRAGMA data_version),
-only vectors for chunks that appeared are read, and rows for chunks that
-vanished are dropped.
+At ~100K chunks a numpy dot product takes a few milliseconds, faster than
+sqlite-vec for large result sets.  The copy is refreshed incrementally: when
+the database has changed (PRAGMA data_version), only vectors for chunks that
+appeared are read, and rows for chunks that vanished are dropped.  When the
+recorded embedding model changes, the copy is rebuilt from scratch.
 """
 
 import threading
@@ -12,7 +12,7 @@ import time
 
 import numpy as np
 
-from .db import EMBEDDING_DIM
+from .db import stored_embedding_model
 
 _READ_BATCH = 500
 
@@ -20,15 +20,20 @@ _READ_BATCH = 500
 MIN_REFRESH_INTERVAL = 30.0
 
 
+def _empty_state():
+    return (
+        np.empty(0, dtype=np.int64),
+        np.empty((0, 0), dtype=np.float32),
+        np.empty(0, dtype=np.int32),
+    )
+
+
 class VectorCache:
     def __init__(self):
         # (chunk ids, normalized vectors, session codes), replaced as a whole
         # so a search never sees a half-refreshed copy.
-        self.state = (
-            np.empty(0, dtype=np.int64),
-            np.empty((0, EMBEDDING_DIM), dtype=np.float32),
-            np.empty(0, dtype=np.int32),
-        )
+        self.state = _empty_state()
+        self._model = None
         self.session_codes: dict[str, int] = {}
         self._data_version = None
         # Held, not just its id: data_version is only comparable on one
@@ -44,7 +49,8 @@ class VectorCache:
     def refresh(self, conn) -> None:
         with self._lock:
             version = conn.execute("PRAGMA data_version").fetchone()[0]
-            if not self._stale and self._conn is conn:
+            same_model = stored_embedding_model(conn) == self._model
+            if not self._stale and self._conn is conn and same_model:
                 if self._data_version == version:
                     return
                 # The hook writes on nearly every tool call; a search may see
@@ -58,6 +64,10 @@ class VectorCache:
             self._sync(conn)
 
     def _sync(self, conn) -> None:
+        model = stored_embedding_model(conn)
+        if model != self._model:
+            self.state = _empty_state()
+            self._model = model
         # Served from the covering (session_id, embedded) index; an ORDER BY
         # id here would read the whole chunks table instead.
         rows = conn.execute(
@@ -84,7 +94,8 @@ class VectorCache:
         new_ids, new_matrix = self._read_vectors(conn, wanted, full=len(known_ids) == 0)
 
         all_ids = np.concatenate([known_ids, new_ids])
-        all_matrix = np.vstack([known_matrix, new_matrix])
+        matrices = [m for m in (known_matrix, new_matrix) if len(m)]
+        all_matrix = np.vstack(matrices) if matrices else known_matrix
         order = np.argsort(all_ids, kind="stable")
         all_ids, all_matrix = all_ids[order], all_matrix[order]
         # A chunk marked embedded whose vector is missing is left out.
@@ -94,7 +105,7 @@ class VectorCache:
     @staticmethod
     def _read_vectors(conn, wanted: np.ndarray, full: bool):
         if len(wanted) == 0:
-            return np.empty(0, dtype=np.int64), np.empty((0, EMBEDDING_DIM), dtype=np.float32)
+            return _empty_state()[:2]
         if full:
             wanted_set = set(wanted.tolist())
             rows = [
@@ -112,10 +123,10 @@ class VectorCache:
                     batch,
                 ))
         if not rows:
-            return np.empty(0, dtype=np.int64), np.empty((0, EMBEDDING_DIM), dtype=np.float32)
+            return _empty_state()[:2]
         ids = np.array([r[0] for r in rows], dtype=np.int64)
         matrix = np.frombuffer(b"".join(r[1] for r in rows), dtype=np.float32)
-        matrix = matrix.reshape(len(rows), EMBEDDING_DIM).copy()
+        matrix = matrix.reshape(len(rows), -1).copy()
         norms = np.linalg.norm(matrix, axis=1, keepdims=True)
         norms[norms == 0] = 1.0
         return ids, matrix / norms
@@ -127,6 +138,8 @@ class VectorCache:
         if len(ids) == 0:
             return []
         query = np.asarray(query_embedding, dtype=np.float32).ravel()
+        if query.shape[0] != matrix.shape[1]:
+            return []
         norm = np.linalg.norm(query)
         if norm > 0:
             query = query / norm
