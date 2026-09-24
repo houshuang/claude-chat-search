@@ -11,6 +11,7 @@ import apsw
 
 from .chunker import create_chunks
 from .db import (
+    write_transaction,
     DB_DIR,
     delete_session_data,
     get_connection,
@@ -108,7 +109,7 @@ def index_single_session(conn, file_info: dict) -> bool:
     if is_excluded_project(file_info["project_path"], cwd=session_data.get("cwd")):
         _file_fingerprints[sid] = current_fp
         if existing:
-            with conn:
+            with write_transaction(conn):
                 delete_session_data(conn, sid)
             logger.info(f"Removed {sid}: its cwd is excluded")
         return False
@@ -134,7 +135,7 @@ def index_single_session(conn, file_info: dict) -> bool:
     session_data.update(metadata)
     chunks = create_chunks(session_data)
 
-    with conn:
+    with write_transaction(conn):
         if existing:
             delete_session_data(conn, sid)
         insert_session(conn, session_data)
