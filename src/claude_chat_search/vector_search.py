@@ -45,7 +45,10 @@ def numpy_vector_search(conn, query_embedding: list[float], limit: int = 20) -> 
         return []
 
     query_vec = np.array(query_embedding, dtype=np.float32)
-    results = vi.search(query_vec, limit=limit)
+    # Accelerate-backed float32 matmul raises spurious divide/overflow/invalid
+    # RuntimeWarnings on macOS even for finite inputs.
+    with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+        results = vi.search(query_vec, limit=limit)
 
     return [
         {"chunk_id": int(r.id), "distance": 1.0 - r.score}

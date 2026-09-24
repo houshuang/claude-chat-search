@@ -28,6 +28,7 @@ from .parser import (
     extract_session_metadata,
     file_info_from_path,
     find_project_dir,
+    is_excluded_project,
     iter_jsonl_files,
     iter_subagent_files,
     parse_jsonl_file,
@@ -43,6 +44,7 @@ BUSY_RETRY_SECONDS = 30
 COOLDOWN_SECONDS = 60
 ACTIVE_COOLDOWN_SECONDS = 300  # 5 min for sessions that keep changing
 EMBED_INTERVAL = 30
+SCAN_INTERVAL = 3600  # hourly fingerprint scan catches transcripts no hook queued
 WAL_CHECKPOINT_INTERVAL = 600  # 10 minutes
 CODE_CHECK_INTERVAL = 300  # 5 min — exit if source code changed (launchd restarts)
 LOG_MAX_BYTES = 1_000_000  # 1MB — truncate daemon.log on startup if larger
@@ -57,6 +59,9 @@ _shutdown = False
 _last_indexed: dict[str, float] = {}  # session_id -> monotonic time of last index
 _file_fingerprints: dict[str, tuple[float, int]] = {}  # session_id -> (mtime, size)
 _reindex_times: dict[str, list[float]] = {}  # session_id -> list of recent index times
+# session_id -> (monotonic due time, transcript path) for work that arrived
+# during a cooldown or hit a busy database; retried once due.
+_deferred: dict[str, tuple[float, str]] = {}
 
 
 def _get_file_fingerprint(path) -> tuple[float, int]:
@@ -96,6 +101,16 @@ def index_single_session(conn, file_info: dict) -> bool:
         return False
 
     if not session_data["messages"]:
+        _file_fingerprints[sid] = current_fp
+        return False
+
+    # Claude names project directories lossily; the recorded cwd is exact.
+    if is_excluded_project(file_info["project_path"], cwd=session_data.get("cwd")):
+        _file_fingerprints[sid] = current_fp
+        if existing:
+            with conn:
+                delete_session_data(conn, sid)
+            logger.info(f"Removed {sid}: its cwd is excluded")
         return False
 
     if existing and existing["message_count"] == session_data["message_count"]:
@@ -180,8 +195,52 @@ def _record_reindex(sid: str):
     _reindex_times[sid] = times
 
 
+def _defer(sid: str, path: str, due: float) -> None:
+    current = _deferred.get(sid)
+    if current is None or due > current[0]:
+        _deferred[sid] = (due, path)
+
+
+def _index_with_cooldown(conn, file_info: dict) -> bool:
+    """Index now, or defer until the session's cooldown has passed."""
+    sid = file_info["session_id"]
+    path = str(file_info["path"])
+    cooldown = _get_cooldown(sid)
+    last = _last_indexed.get(sid)
+    if last is not None and time.monotonic() - last < cooldown:
+        _defer(sid, path, last + cooldown)
+        return False
+    try:
+        indexed = index_single_session(conn, file_info)
+    except apsw.BusyError:
+        logger.warning(f"Database busy; deferring {sid} by {BUSY_RETRY_SECONDS}s")
+        _defer(sid, path, time.monotonic() + BUSY_RETRY_SECONDS)
+        return False
+    if indexed:
+        _last_indexed[sid] = time.monotonic()
+        _record_reindex(sid)
+        logger.info(f"Indexed {sid} (cooldown={int(cooldown)}s)")
+    return indexed
+
+
+def _index_paths(conn, paths) -> int:
+    indexed = 0
+    for transcript_path in paths:
+        if _shutdown:
+            break
+        file_info = file_info_from_path(transcript_path)
+        if file_info is None:
+            continue
+        if _index_with_cooldown(conn, file_info):
+            indexed += 1
+    return indexed
+
+
 def process_queue(conn) -> int:
-    """Atomically grab the queue file, dedupe paths, index each. Returns count indexed."""
+    """Atomically grab the queue file, dedupe paths, index each. Returns count indexed.
+
+    Paths still in cooldown are deferred, not dropped; see process_deferred().
+    """
     if not QUEUE_PATH.exists():
         return 0
 
@@ -199,27 +258,15 @@ def process_queue(conn) -> int:
             pass
 
     unique_paths = list(dict.fromkeys(p.strip() for p in paths if p.strip()))
+    return _index_paths(conn, unique_paths)
 
-    indexed = 0
-    for transcript_path in unique_paths:
-        if _shutdown:
-            break
-        file_info = file_info_from_path(transcript_path)
-        if file_info is None:
-            continue
-        sid = file_info["session_id"]
-        now = time.monotonic()
 
-        cooldown = _get_cooldown(sid)
-        if now - _last_indexed.get(sid, 0) < cooldown:
-            continue
-        if index_single_session(conn, file_info):
-            _last_indexed[sid] = time.monotonic()
-            _record_reindex(sid)
-            indexed += 1
-            logger.info(f"Indexed {sid} (cooldown={int(cooldown)}s)")
-
-    return indexed
+def process_deferred(conn) -> int:
+    """Index deferred sessions whose due time has passed."""
+    now = time.monotonic()
+    due = [sid for sid, (when, _path) in _deferred.items() if when <= now]
+    paths = [_deferred.pop(sid)[1] for sid in due]
+    return _index_paths(conn, paths)
 
 
 def full_scan(conn) -> int:
@@ -229,18 +276,14 @@ def full_scan(conn) -> int:
     for file_info in files:
         if _shutdown:
             break
-        if index_single_session(conn, file_info):
-            sid = file_info["session_id"]
-            _record_reindex(sid)
-            _last_indexed[sid] = time.monotonic()
+        if _index_with_cooldown(conn, file_info):
             indexed += 1
     return indexed
 
 
 def run_embeddings(conn):
     """Run embedding pipeline in batches, checking shutdown between batches."""
-    from .embedder import embed_texts, embedding_lock
-    from .db import insert_embeddings
+    from .embedder import EmbeddingUnavailable, embed_rows, embedding_lock
 
     with embedding_lock() as acquired:
         if not acquired:
@@ -252,15 +295,17 @@ def run_embeddings(conn):
             if not rows:
                 break
 
-            texts = [r["combined_text"] for r in rows]
-            chunk_ids = [r["id"] for r in rows]
-
             try:
-                embeddings = embed_texts(texts)
-                insert_embeddings(conn, chunk_ids, embeddings)
+                _stored, skipped = embed_rows(conn, rows)
+            except EmbeddingUnavailable:
+                logger.exception("Embedding model unavailable; retrying next pass")
+                break
             except Exception:
                 logger.exception("Embedding batch failed")
                 break
+            if skipped:
+                logger.warning("Skipped %d chunk(s) that cannot be embedded: %s",
+                               len(skipped), skipped)
 
 
 def wal_checkpoint(conn):
@@ -375,14 +420,24 @@ def run():
     last_embed_time = time.monotonic()
     last_wal_checkpoint = time.monotonic()
     last_code_check = time.monotonic()
+    last_scan = time.monotonic()
 
     while not _shutdown:
         try:
-            indexed = process_queue(conn)
+            indexed = process_queue(conn) + process_deferred(conn)
             if indexed > 0:
                 logger.info(f"Queue batch: indexed {indexed} sessions")
         except Exception:
             logger.exception("Error processing queue")
+
+        if time.monotonic() - last_scan >= SCAN_INTERVAL:
+            try:
+                count = full_scan(conn)
+                if count:
+                    logger.info(f"Periodic scan: indexed {count} sessions")
+            except Exception:
+                logger.exception("Error in periodic scan")
+            last_scan = time.monotonic()
 
         # Run embeddings on a separate timer, independent of indexing
         now = time.monotonic()

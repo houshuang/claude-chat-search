@@ -6,7 +6,7 @@ Semantic search over Claude Code and Codex conversations. Indexes JSONL conversa
 
 - `db.py` — SQLite schema, CRUD, vector/FTS search. Uses APSW + sqlite-vec extension.
 - `cli.py` — Click CLI: `init`, `index`, `search`, `daemon start/stop`, etc.
-- `daemon.py` — Background process that watches for new/changed conversations and indexes them.
+- `daemon.py` — Background process that indexes queued conversations, defers work that arrives during a session's cooldown, and rescans fingerprints hourly.
 - `parser.py` — Parses Claude Code JSONL conversation files, extracts metadata.
 - `codex_parser.py` — Parses only visible conversation from Codex rollout files; excludes system/developer prompts, reasoning, tools, outputs, state, and subagent rollouts.
 - `sources.py` — Source-neutral discovery/parser dispatch.
@@ -17,11 +17,15 @@ Semantic search over Claude Code and Codex conversations. Indexes JSONL conversa
 - `cross_search.py` — Cross-index search across multiple chat indexes.
 - `search.py` also supports `expand=True` for LLM query expansion (lex/vec/hyde variants via limbic's `expand_query` + `multi_list_rrf`).
 
-## DB Schema (index.db in ~/.claude-chat-search/)
+## DB Schema (index.db in ~/.claude-chat-search/, or $CLAUDE_CHAT_SEARCH_HOME)
 
 Tables: `sessions`, `subagents`, `chunks`, `chunks_fts` (FTS5), `vec_chunks` (sqlite-vec).
 
-Codex sessions use namespaced internal IDs (`codex:<native-id>`) and retain the native ID in `sessions.native_session_id`. Never feed Codex `response_item` records into chunks: they contain reasoning, tool arguments, and outputs that are intentionally outside the searchable conversation corpus.
+Codex sessions use namespaced internal IDs (`codex:<native-id>`) and retain the native ID in `sessions.native_session_id`. Since September 2026 Codex rollouts carry the conversation only as `response_item` records of type `message`; `codex_parser.py` takes role `user` `input_text` (stripped of injected AGENTS.md / `<environment_context>` / other wrapped context blocks) and role `assistant` `output_text`, and nothing else. Never feed other `response_item` types (reasoning, tool calls and outputs, inter-agent `agent_message`) or developer messages into chunks. Older rollouts that still have `event_msg` `user_message`/`agent_message` are read from those instead.
+
+Schema changes go in `db._migrate()` together with a bump of `db.SCHEMA_VERSION`; `init_db()` returns immediately once `PRAGMA user_version` has reached it. Read-only commands use `get_read_connection()`.
+
+`chunks.embedded` is 0 (pending), 1 (embedded) or -1 (the model failed on this chunk; skipped until `reembed`).
 
 ### FK Delete Order — CRITICAL
 

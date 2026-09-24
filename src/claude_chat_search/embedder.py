@@ -1,14 +1,21 @@
 from __future__ import annotations
 
 import fcntl
+import logging
 from contextlib import contextmanager
 
 from limbic.amygdala import EmbeddingModel
 
 from . import db
-from .db import get_unembedded_chunks, insert_embeddings
+from .db import get_unembedded_chunks, insert_embeddings, mark_embedding_failed
 
 BATCH_SIZE = 256
+
+logger = logging.getLogger(__name__)
+
+
+class EmbeddingUnavailable(RuntimeError):
+    """The model fails even on a trivial input, so no row can be blamed."""
 
 _model: EmbeddingModel | None = None
 
@@ -62,6 +69,36 @@ def process_embeddings(conn, callback=None) -> int:
         return _process_embeddings_locked(conn, callback)
 
 
+def embed_rows(conn, rows: list[dict]) -> tuple[int, list[int]]:
+    """Embed and store rows; returns (stored, skipped chunk ids).
+
+    A failing batch is split in half until the rows the model cannot embed
+    are isolated; those are marked failed and logged instead of being retried
+    forever.  If the model fails on a trivial probe too, the failure is not
+    about any row: EmbeddingUnavailable is raised and nothing is marked.
+    Database errors propagate unchanged, so the batch is retried later.
+    """
+    if not rows:
+        return 0, []
+    try:
+        embeddings = embed_texts([r["combined_text"] for r in rows])
+    except Exception:
+        try:
+            embed_texts(["ok"])
+        except Exception as probe_error:
+            raise EmbeddingUnavailable("embedding model is failing") from probe_error
+        if len(rows) == 1:
+            logger.exception("Skipping chunk %s: it cannot be embedded", rows[0]["id"])
+            mark_embedding_failed(conn, rows[0]["id"])
+            return 0, [rows[0]["id"]]
+        middle = len(rows) // 2
+        stored_a, skipped_a = embed_rows(conn, rows[:middle])
+        stored_b, skipped_b = embed_rows(conn, rows[middle:])
+        return stored_a + stored_b, skipped_a + skipped_b
+    insert_embeddings(conn, [r["id"] for r in rows], embeddings)
+    return len(rows), []
+
+
 def _process_embeddings_locked(conn, callback=None) -> int:
     total = 0
 
@@ -70,13 +107,9 @@ def _process_embeddings_locked(conn, callback=None) -> int:
         if not rows:
             break
 
-        texts = [row["combined_text"] for row in rows]
-        chunk_ids = [row["id"] for row in rows]
+        stored, _skipped = embed_rows(conn, rows)
 
-        embeddings = embed_texts(texts)
-        insert_embeddings(conn, chunk_ids, embeddings)
-
-        total += len(rows)
+        total += stored
         if callback:
             callback(total)
 

@@ -2,7 +2,7 @@
 
 Semantic search over your past Claude Code and Codex conversations. Indexes the JSONL conversation logs in `~/.claude/projects/`, `~/.codex/sessions/`, and `~/.codex/archived_sessions/` into a local SQLite database with hybrid search — full-text keyword search (FTS5) and vector similarity search (via [limbic](https://github.com/houshuang/limbic)), combined using Reciprocal Rank Fusion.
 
-Codex indexing is deliberately conversation-only: visible user and agent messages are indexed. Developer/system prompts, reasoning, tool calls, tool outputs, token accounting, world state, and Codex subagent rollouts are excluded.
+Codex indexing is deliberately conversation-only: visible user and agent messages are indexed. Developer/system prompts, context Codex injects into user messages (`AGENTS.md`, `<environment_context>`, `<user_instructions>` and similar blocks), reasoning, tool calls, tool outputs, token accounting, world state, and Codex subagent rollouts are excluded.
 
 Claude Code keeps every session on disk, but `claude --resume` only lets you pick from a list. This tool lets you (or Claude, through the bundled skill) ask "where did we fix the auth bug?" and get back the session, project, branch and the matching turn, then resume it.
 
@@ -47,6 +47,8 @@ claude-chat-search init
 
 Creates the database at `~/.claude-chat-search/index.db`, indexes all existing conversations, and generates embeddings using a local model (`paraphrase-multilingual-MiniLM-L12-v2`, 384-dim).
 
+Set `CLAUDE_CHAT_SEARCH_HOME` to keep the index, queue, logs, exclusion list and backups somewhere other than `~/.claude-chat-search` (useful for tests and throwaway copies). `CHAT_SEARCH_DB_PATH` still overrides the database file alone.
+
 `init` defaults to Claude for backward compatibility. Add Codex history separately:
 
 ```bash
@@ -62,6 +64,10 @@ claude-chat-search index
 Only indexes new or modified sessions since the last run. Use `--all --force` to re-index everything from scratch.
 
 Use `--source claude`, `--source codex`, or `--source all` to select inputs. File mtime and size fingerprints are persisted in SQLite, so unchanged Codex scans do not parse multi-gigabyte rollout files.
+
+Codex's rollout format is undocumented and changes. If a Codex rollout in which the agent took a turn yields no messages, `index` prints a warning with the count; if every such rollout in the run yields nothing, `index` exits non-zero, which shows up as a failed run of the scheduled job.
+
+Searches (`search`, `cross`, `show`, `recover`, `resume`) open the index read-only and never take the write lock. Schema migrations run once, when `PRAGMA user_version` is behind, from whichever command opens the database first.
 
 ### Search
 
@@ -90,9 +96,28 @@ Options:
 
 ```bash
 claude-chat-search backup
+claude-chat-search backup --keep 4
 ```
 
-Creates a consistent online SQLite backup under `~/.claude-chat-search/backups/` and prints its SHA-256 checksum. The backup command intentionally performs no schema migration.
+Creates a consistent online SQLite backup under `~/.claude-chat-search/backups/`, runs `PRAGMA integrity_check` on the copy, and prints its SHA-256 checksum. If the check fails, the copy is renamed `*.failed-integrity`, nothing is pruned, and the command exits non-zero. `--keep N` then deletes all but the newest N `index-*.db` backups in that directory. The backup command intentionally performs no schema migration.
+
+A weekly backup job (Sundays 04:30, keeping four) is included. Like the other plists it contains the author's paths; edit the Python path and log paths first:
+
+```bash
+cp com.claude-chat-search.backup.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.claude-chat-search.backup.plist
+```
+
+### Exclude projects
+
+```bash
+claude-chat-search exclude add /path/to/private-project
+claude-chat-search exclude list
+claude-chat-search purge-excluded --dry-run
+claude-chat-search purge-excluded
+```
+
+`~/.claude-chat-search/excluded_projects.txt` holds one path per line; sessions in that directory or below are never indexed, and their queries are not written to `search.log`. Matching uses the transcript's recorded `cwd` and Claude's encoded project-directory name, so paths containing hyphens are matched correctly (an excluded `/a/priv` also excludes a hyphenated sibling such as `/a/priv-other`). `purge-excluded` deletes sessions, chunks, full-text rows and vectors already indexed under excluded paths; `--dry-run` only reports counts per excluded path.
 
 ### Inspect a session
 
@@ -132,7 +157,7 @@ claude-chat-search subagent <session-id> <agent-id> --raw  # untruncated
 
 ## Continuous indexing with daemon
 
-Instead of spawning a subprocess on every tool call, a persistent daemon handles all indexing. A `PostToolUse` hook appends the transcript path to a queue file; the daemon picks it up every 2 seconds.
+Instead of spawning a subprocess on every tool call, a persistent daemon handles all indexing. A `PostToolUse` hook appends the transcript path to a queue file; the daemon picks it up every 2 seconds. A session re-indexed within its cooldown (60 seconds, five minutes for very active sessions) is deferred and indexed when the cooldown ends. An hourly scan compares transcript mtime and size fingerprints and picks up anything no hook queued.
 
 ### Start the daemon
 
@@ -185,6 +210,23 @@ Requires [jq](https://jqlang.org/). Add to `~/.claude/settings.json`:
 
 The hook appends the active transcript path to the queue file. The daemon atomically renames it for processing, deduplicates paths, and only re-indexes sessions whose message count has changed — preserving existing embeddings for unchanged content.
 
+`PostToolUse` does not fire after a final answer that used no tools, so the last turn of a session can wait for the hourly scan. Optionally queue the transcript when a turn or session ends as well, with the same command under `Stop` and `SessionEnd`:
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "jq -r .transcript_path >> ~/.claude-chat-search/.queue" } ] }
+    ],
+    "SessionEnd": [
+      { "hooks": [ { "type": "command", "command": "jq -r .transcript_path >> ~/.claude-chat-search/.queue" } ] }
+    ]
+  }
+}
+```
+
+A chunk the embedding model cannot process is isolated by splitting its batch, logged, and marked `embedded = -1` so it is not retried forever; `reembed` resets it.
+
 ### Low-priority periodic Codex indexing
 
 Codex does not expose the Claude-style post-tool hook used above. The included launchd job scans Codex history every three hours. Like the daemon plist, it contains the author's paths; edit the Python path and log paths first:
@@ -217,7 +259,7 @@ Then Claude Code will search your past conversations when you ask things like "r
 - **vector_search.py** — in-memory numpy vector search using limbic's `VectorIndex` with module-level caching
 - **db.py** — SQLite with FTS5 for keyword search and `sqlite-vec` for vector storage
 - **search.py** — hybrid search (vector + keyword + grep + file) combined via Reciprocal Rank Fusion, deduplicated by session, with optional cross-encoder reranking and LLM query expansion (lex/vec/hyde variants) via limbic
-- **daemon.py** — persistent indexer daemon: queue-based incremental indexing, message-count skip, startup full scan
-- **cli.py** — Click CLI exposing `init`, `index`, `search`, `resume`, `show`, `subagents`, `subagent`, `recover`, `reembed`, `summarize`, `cross`, and `daemon` commands
+- **daemon.py** — persistent indexer daemon: queue-based incremental indexing with deferred retries, message-count skip, startup and hourly fingerprint scans
+- **cli.py** — Click CLI exposing `init`, `index`, `search`, `resume`, `show`, `subagents`, `subagent`, `recover`, `reembed`, `summarize`, `cross`, `backup`, `exclude`, `purge-excluded`, and `daemon` commands
 
 `cross` (chat history plus a separate research-file index) and `summarize` (topic summaries) depend on the author's own tooling at fixed local paths and will not work on other machines as-is.

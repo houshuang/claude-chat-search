@@ -6,29 +6,71 @@ from pathlib import Path
 import apsw
 import sqlite_vec
 
+from .paths import DATA_DIR
+
 _configured_db_path = os.environ.get("CHAT_SEARCH_DB_PATH")
 DB_PATH = (
     Path(_configured_db_path).expanduser()
     if _configured_db_path
-    else Path.home() / ".claude-chat-search" / "index.db"
+    else DATA_DIR / "index.db"
 )
 DB_DIR = DB_PATH.parent
 EMBEDDING_DIM = 384
 
 
-def get_connection() -> apsw.Connection:
-    DB_DIR.mkdir(parents=True, exist_ok=True)
-    conn = apsw.Connection(str(DB_PATH))
+# Bump when init_db() gains a migration; init_db() is a no-op once the
+# database's user_version has reached it.
+SCHEMA_VERSION = 1
+
+
+def _load_vec(conn: apsw.Connection) -> None:
     conn.enable_load_extension(True)
     conn.load_extension(sqlite_vec.loadable_path())
     conn.enable_load_extension(False)
+
+
+def get_connection(readonly: bool = False) -> apsw.Connection:
+    if readonly:
+        conn = apsw.Connection(str(DB_PATH), flags=apsw.SQLITE_OPEN_READONLY)
+        _load_vec(conn)
+        conn.setbusytimeout(30000)
+        conn.execute("PRAGMA cache_size=-64000")
+        return conn
+
+    DB_DIR.mkdir(parents=True, exist_ok=True)
+    conn = apsw.Connection(str(DB_PATH))
+    _load_vec(conn)
+    conn.setbusytimeout(30000)
     try:
         conn.execute("PRAGMA journal_mode=WAL")
     except apsw.CantOpenError:
         pass  # directory may be locked; fall back to default journal mode
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA cache_size=-64000")
     conn.execute("PRAGMA foreign_keys=ON")
-    conn.setbusytimeout(5000)
     return conn
+
+
+def get_read_connection() -> apsw.Connection:
+    """Open the index read-only, migrating it first only if it is behind."""
+    if not DB_PATH.exists():
+        raise FileNotFoundError(
+            f"No index at {DB_PATH}; run `claude-chat-search init` first"
+        )
+    conn = get_connection(readonly=True)
+    if schema_version(conn) >= SCHEMA_VERSION:
+        return conn
+    conn.close()
+    writer = get_connection()
+    try:
+        init_db(writer)
+    finally:
+        writer.close()
+    return get_connection(readonly=True)
+
+
+def schema_version(conn: apsw.Connection) -> int:
+    return conn.execute("PRAGMA user_version").fetchone()[0]
 
 
 def backup_database(conn: apsw.Connection, destination: Path | None = None) -> Path:
@@ -47,8 +89,35 @@ def backup_database(conn: apsw.Connection, destination: Path | None = None) -> P
         backup.step(-1)
     finally:
         backup.finish()
+    try:
+        # The copy inherits WAL mode; a self-contained single file is what a
+        # backup should be.
+        backup_conn.execute("PRAGMA journal_mode=DELETE")
+    finally:
         backup_conn.close()
     return destination
+
+
+def integrity_check(path: Path) -> list[str]:
+    """Run PRAGMA integrity_check on a database file; returns [] when healthy."""
+    conn = apsw.Connection(str(path), flags=apsw.SQLITE_OPEN_READONLY)
+    try:
+        _load_vec(conn)
+        rows = [row[0] for row in conn.execute("PRAGMA integrity_check")]
+    finally:
+        conn.close()
+    return [] if rows == ["ok"] else rows
+
+
+def prune_backups(directory: Path, keep: int) -> list[Path]:
+    """Delete all but the newest `keep` timestamped backups in directory."""
+    backups = sorted(Path(directory).glob("index-*.db"), reverse=True)
+    removed = backups[keep:]
+    for path in removed:
+        path.unlink()
+        for suffix in ("-wal", "-shm"):
+            Path(str(path) + suffix).unlink(missing_ok=True)
+    return removed
 
 
 def _fetchall(conn: apsw.Connection, sql: str, bindings=None) -> list[dict]:
@@ -67,6 +136,15 @@ def _fetchone(conn: apsw.Connection, sql: str, bindings=None) -> dict | None:
 
 
 def init_db(conn: apsw.Connection) -> None:
+    """Create or migrate the schema.  Cheap no-op when already current."""
+    if schema_version(conn) >= SCHEMA_VERSION:
+        return
+    with conn:
+        _migrate(conn)
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+
+def _migrate(conn: apsw.Connection) -> None:
     conn.execute("""
         CREATE TABLE IF NOT EXISTS sessions (
             session_id TEXT PRIMARY KEY,
@@ -282,23 +360,24 @@ def insert_chunks(conn: apsw.Connection, chunks: list[dict]) -> list[int]:
 
 
 def insert_embeddings(conn: apsw.Connection, chunk_ids: list[int], embeddings: list[list[float]]) -> None:
-    for chunk_id, emb in zip(chunk_ids, embeddings):
-        try:
-            conn.execute(
-                "INSERT OR REPLACE INTO vec_chunks (chunk_id, embedding) VALUES (?, ?)",
-                (chunk_id, serialize_embedding(emb)),
-            )
-        except apsw.SQLError as error:
-            # sqlite-vec can surface a primary-key race as SQLError even for
-            # INSERT OR REPLACE.  If another indexer completed this exact chunk,
-            # accept its vector; otherwise preserve the real failure.
-            duplicate = "UNIQUE constraint failed on vec_chunks primary key" in str(error)
-            exists = duplicate and conn.execute(
-                "SELECT 1 FROM vec_chunks WHERE chunk_id = ?", (chunk_id,)
-            ).fetchone()
-            if not exists:
-                raise
-        conn.execute("UPDATE chunks SET embedded = 1 WHERE id = ?", (chunk_id,))
+    with conn:
+        for chunk_id, emb in zip(chunk_ids, embeddings):
+            try:
+                conn.execute(
+                    "INSERT OR REPLACE INTO vec_chunks (chunk_id, embedding) VALUES (?, ?)",
+                    (chunk_id, serialize_embedding(emb)),
+                )
+            except apsw.SQLError as error:
+                # sqlite-vec can surface a primary-key race as SQLError even for
+                # INSERT OR REPLACE.  If another indexer completed this exact chunk,
+                # accept its vector; otherwise preserve the real failure.
+                duplicate = "UNIQUE constraint failed on vec_chunks primary key" in str(error)
+                exists = duplicate and conn.execute(
+                    "SELECT 1 FROM vec_chunks WHERE chunk_id = ?", (chunk_id,)
+                ).fetchone()
+                if not exists:
+                    raise
+            conn.execute("UPDATE chunks SET embedded = 1 WHERE id = ?", (chunk_id,))
     # Invalidate numpy search cache so it picks up new embeddings
     from .vector_search import invalidate_cache
     invalidate_cache()
@@ -313,6 +392,14 @@ def delete_session_data(conn: apsw.Connection, session_id: str) -> None:
     conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
     from .vector_search import invalidate_cache
     invalidate_cache()
+
+
+def mark_embedding_failed(conn: apsw.Connection, chunk_id: int) -> None:
+    """Park a chunk the model cannot embed so it is not retried forever.
+
+    embedded = -1 is excluded from get_unembedded_chunks(); `reembed` resets it.
+    """
+    conn.execute("UPDATE chunks SET embedded = -1 WHERE id = ?", (chunk_id,))
 
 
 def get_unembedded_chunks(conn: apsw.Connection, batch_size: int = 100) -> list[dict]:

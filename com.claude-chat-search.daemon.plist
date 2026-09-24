@@ -18,6 +18,11 @@
     <true/>
     <key>ThrottleInterval</key>
     <integer>10</integer>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>TOKENIZERS_PARALLELISM</key>
+        <string>false</string>
+    </dict>
     <key>StandardOutPath</key>
     <string>/Users/stian/.claude-chat-search/daemon-stdout.log</string>
     <key>StandardErrorPath</key>
