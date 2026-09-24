@@ -61,7 +61,7 @@ claude-chat-search index --source codex
 claude-chat-search index
 ```
 
-Only indexes new or modified sessions since the last run. Use `--all --force` to re-index everything from scratch.
+Only indexes new or modified sessions since the last run. `--all --force` rebuilds every session whose transcript is still on disk from scratch. Claude Code deletes old transcripts, so for older sessions the index is the only copy; those are kept as they are.
 
 Re-indexing a changed session keeps every chunk whose turn number and text are unchanged, with its vector; only new or changed chunks are embedded. Chunks never exceed about 600 tokens: a paragraph longer than that is split at line breaks, then sentences, then words, and a long prompt gets chunks of its own. Sessions indexed before this rule can still hold much larger chunks; `migrate-embeddings` re-chunks them (see below), including sessions whose transcript is no longer on disk. (`reembed` recomputes vectors but keeps the chunks.)
 

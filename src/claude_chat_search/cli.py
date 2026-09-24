@@ -143,19 +143,18 @@ def index(index_all, force, source):
     init_db(conn)
 
     if index_all and force:
-        click.echo(f"Re-indexing {source} conversations from scratch...")
-        if source == "all":
-            # Drop and recreate vec table — sqlite-vec doesn't reclaim space on DELETE
-            from .db import migrate_vec_table
+        # Most old transcripts are gone from disk, so the index is the only copy
+        # of those sessions: rebuild only what can be rebuilt, keep the rest.
+        on_disk = {f["session_id"] for f in iter_conversation_files(source)}
+        indexed = get_session_ids_by_source(conn, source)
+        rebuild = [sid for sid in indexed if sid in on_disk]
+        kept = len(indexed) - len(rebuild)
+        click.echo(
+            f"Re-indexing {len(rebuild)} {source} sessions from their transcripts; "
+            f"keeping {kept} whose transcript is no longer on disk."
+        )
+        for session_id in rebuild:
             with write_transaction(conn):
-                migrate_vec_table(conn)
-            conn.execute("PRAGMA foreign_keys=OFF")
-            conn.execute("DELETE FROM chunks")
-            conn.execute("DELETE FROM subagents")
-            conn.execute("DELETE FROM sessions")
-            conn.execute("PRAGMA foreign_keys=ON")
-        else:
-            for session_id in get_session_ids_by_source(conn, source):
                 delete_session_data(conn, session_id)
         from .vector_search import invalidate_cache
         invalidate_cache()
