@@ -7,8 +7,11 @@ dependencies = [
     "apsw>=3.45",
     "click>=8.0",
     "limbic @ git+https://github.com/houshuang/limbic.git",
+    "sentence-transformers>=3.0",
     "sqlite-vec>=0.1.6",
     "tiktoken>=0.7",
+    # ModernBERT (the granite embedding models) and the `dtype` load argument.
+    "transformers>=4.56",
 ]
 
 [project.scripts]

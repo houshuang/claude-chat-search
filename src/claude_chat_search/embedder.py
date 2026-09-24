@@ -53,8 +53,16 @@ def _get_model():
             kwargs = {}
             gpu = torch.backends.mps.is_available() or torch.cuda.is_available()
             if _spec.half_precision and gpu:
-                kwargs["model_kwargs"] = {"torch_dtype": torch.float16}
-            _model = SentenceTransformer(_spec.name, **kwargs)
+                kwargs["model_kwargs"] = {"dtype": torch.float16}
+            # transformers 4.57 misreads the granite tokenizer as a Mistral one
+            # and warns on every load; the suggested fix does not apply to it.
+            tokenizer_log = logging.getLogger("transformers.tokenization_utils_base")
+            level = tokenizer_log.level
+            tokenizer_log.setLevel(logging.ERROR)
+            try:
+                _model = SentenceTransformer(_spec.name, **kwargs)
+            finally:
+                tokenizer_log.setLevel(level)
             _model.max_seq_length = _spec.max_tokens
         return _model, _spec
 

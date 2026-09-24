@@ -106,7 +106,7 @@ Measured on a 1.4 GB index (5.7k sessions, 114k chunks, granite-311m): median 0.
 
 The index records which model produced its vectors (the `meta` table). A query is only ever compared with vectors from the model that embeds it: if the stored model differs from the configured one, `search`, `resume` and `cross` fall back to keyword search and print a warning, and nothing new is embedded until the index is migrated.
 
-The default is `ibm-granite/granite-embedding-311m-multilingual-r2`. Models are listed in `models.py`; `CLAUDE_CHAT_SEARCH_MODEL` selects another one from that list (for example `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`, the model used before September 2026).
+The default is `ibm-granite/granite-embedding-311m-multilingual-r2` (Apache 2.0, 311M parameters, 768 dimensions, run in float16 on Apple GPUs). It replaced `paraphrase-multilingual-MiniLM-L12-v2`, which reads only the first 128 tokens of a chunk, after a September 2026 comparison on 53 known-answer queries (English, Norwegian and cross-lingual) against the author's history: session-level MRR of the full hybrid search went from 0.52 to 0.65 and recall@10 from 0.83 to 0.98. Larger models (bge-m3, Qwen3-Embedding-0.6B, embeddinggemma-300m, multilingual-e5-large) ranked no better and would take 2.5–10 hours to embed the index. Models are listed in `models.py`; `CLAUDE_CHAT_SEARCH_MODEL` selects another one from that list (for example `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`, the model used before September 2026).
 
 To move an index to the configured model:
 
@@ -114,7 +114,7 @@ To move an index to the configured model:
 claude-chat-search migrate-embeddings
 ```
 
-It backs up the index, re-chunks every session with the current chunker (from the transcript when it still exists, otherwise from the stored text, re-split to the current chunk size), recreates the vector table at the new width and embeds every chunk. It is safe to interrupt and run again; it resumes where it stopped. The daemon can keep running: keyword search works throughout. Until the switch to the new vector table (after re-chunking) semantic search is off; after it, semantic search covers the chunks embedded so far and a note says the migration is in progress. `--no-backup` skips the backup. On the author's machine (Apple M4 Pro, ~{NCHUNKS} chunks) it takes about {DURATION}.
+It backs up the index, re-chunks every session with the current chunker (from the transcript when it still exists, otherwise from the stored text, re-split to the current chunk size), recreates the vector table at the new width and embeds every chunk. It is safe to interrupt and run again; it resumes where it stopped. The daemon can keep running: keyword search works throughout. Until the switch to the new vector table (after re-chunking) semantic search is off; after it, semantic search covers the chunks embedded so far and a note says the migration is in progress. `--no-backup` skips the backup. On the author's machine (Apple M4 Pro, 5,800 sessions, 114,000 chunks after re-chunking) it took 100 minutes: three minutes of re-chunking, the rest embedding at about 20 chunks a second. The index grew from 1.1 to 1.4 GB.
 
 ### Back up the index
 

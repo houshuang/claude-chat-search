@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.11"
 
 [[package]]
@@ -181,8 +181,10 @@ dependencies = [
     { name = "apsw" },
     { name = "click" },
     { name = "limbic" },
+    { name = "sentence-transformers" },
     { name = "sqlite-vec" },
     { name = "tiktoken" },
+    { name = "transformers" },
 ]
 
 [package.metadata]
@@ -190,8 +192,10 @@ requires-dist = [
     { name = "apsw", specifier = ">=3.45" },
     { name = "click", specifier = ">=8.0" },
     { name = "limbic", git = "https://github.com/houshuang/limbic.git" },
+    { name = "sentence-transformers", specifier = ">=3.0" },
     { name = "sqlite-vec", specifier = ">=0.1.6" },
     { name = "tiktoken", specifier = ">=0.7" },
+    { name = "transformers", specifier = ">=4.56" },
 ]
 
 [[package]]
