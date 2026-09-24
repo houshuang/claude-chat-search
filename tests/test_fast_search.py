@@ -142,6 +142,12 @@ class MigrationTests(FastSearchCase):
 
 
 class VectorCacheTests(FastSearchCase):
+    def setUp(self):
+        super().setUp()
+        interval = patch.object(vector_search, "MIN_REFRESH_INTERVAL", 0.0)
+        interval.start()
+        self.addCleanup(interval.stop)
+
     def test_refresh_adds_and_drops_rows_incrementally(self):
         ids = self.add("s1", "/p", [("one", unit(0)), ("two", unit(1))])
         reader = db.get_read_connection()
@@ -170,6 +176,32 @@ class VectorCacheTests(FastSearchCase):
         with patch.object(cache, "_sync") as sync:
             cache.refresh(reader)
         sync.assert_not_called()
+
+    def test_changes_within_the_refresh_interval_are_not_resynced(self):
+        self.add("s1", "/p", [("one", unit(0))])
+        reader = db.get_read_connection()
+        self.addCleanup(reader.close)
+        cache = vector_search.VectorCache()
+        cache.refresh(reader)
+        self.add("s2", "/p", [("two", unit(1))])
+        with patch.object(vector_search, "MIN_REFRESH_INTERVAL", 60.0), \
+                patch.object(cache, "_sync") as sync:
+            cache.refresh(reader)
+        sync.assert_not_called()
+
+    def test_writes_without_new_vectors_skip_the_matrix_rebuild(self):
+        self.add("s1", "/p", [("one", unit(0))])
+        reader = db.get_read_connection()
+        self.addCleanup(reader.close)
+        cache = vector_search.VectorCache()
+        cache.refresh(reader)
+        matrix = cache.state[1]
+        with db.write_transaction(self.conn):
+            self.conn.execute("UPDATE sessions SET project_path = project_path")
+        with patch.object(cache, "_read_vectors") as reads:
+            cache.refresh(reader)
+        reads.assert_not_called()
+        self.assertIs(cache.state[1], matrix)
 
     def test_search_within_allowed_sessions(self):
         self.add("near", "/p", [("a", unit(0))])
