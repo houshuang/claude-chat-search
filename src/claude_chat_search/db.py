@@ -1,5 +1,6 @@
 import os
 import struct
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -27,6 +28,28 @@ def _load_vec(conn: apsw.Connection) -> None:
     conn.enable_load_extension(True)
     conn.load_extension(sqlite_vec.loadable_path())
     conn.enable_load_extension(False)
+
+
+@contextmanager
+def write_transaction(conn: apsw.Connection):
+    """Write transaction that takes the write lock up front.
+
+    A deferred transaction that reads before it writes cannot wait for the lock:
+    if another connection commits in between, SQLite returns BUSY immediately and
+    the busy timeout never applies. BEGIN IMMEDIATE waits for the lock instead.
+    Nested use falls back to a savepoint inside the outer transaction.
+    """
+    if conn.in_transaction:
+        with conn:
+            yield
+        return
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    conn.execute("COMMIT")
 
 
 def get_connection(readonly: bool = False) -> apsw.Connection:
@@ -139,7 +162,7 @@ def init_db(conn: apsw.Connection) -> None:
     """Create or migrate the schema.  Cheap no-op when already current."""
     if schema_version(conn) >= SCHEMA_VERSION:
         return
-    with conn:
+    with write_transaction(conn):
         _migrate(conn)
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
@@ -360,7 +383,7 @@ def insert_chunks(conn: apsw.Connection, chunks: list[dict]) -> list[int]:
 
 
 def insert_embeddings(conn: apsw.Connection, chunk_ids: list[int], embeddings: list[list[float]]) -> None:
-    with conn:
+    with write_transaction(conn):
         for chunk_id, emb in zip(chunk_ids, embeddings):
             try:
                 conn.execute(

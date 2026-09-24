@@ -10,6 +10,7 @@ import click
 
 from .chunker import create_chunks
 from .db import (
+    write_transaction,
     DB_PATH,
     _fetchall,
     backup_database,
@@ -978,7 +979,7 @@ def _count_session_rows(conn, session_ids: list[str]) -> tuple[int, int]:
 
 
 def _purge_sessions(conn, session_ids: list[str]) -> None:
-    with conn:
+    with write_transaction(conn):
         for sid in session_ids:
             delete_session_data(conn, sid)
 
@@ -1206,7 +1207,7 @@ def _run_index(conn, force: bool = False, source: str = "claude",
             # then swap it inside one transaction.  A malformed active rollout
             # can never erase a previously indexed conversation.
             saved_summary = get_topic_summary(conn, sid) if existing else None
-            with conn:
+            with write_transaction(conn):
                 if existing:
                     delete_session_data(conn, sid)
                 insert_session(conn, session_data)
