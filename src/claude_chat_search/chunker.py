@@ -9,6 +9,8 @@ MAX_CHUNK_TOKENS = 600
 MIN_CHUNK_TOKENS = 150
 MERGE_TARGET_TOKENS = 200
 OVERLAP_RATIO = 0.25
+# Longest user prompt repeated in front of every part of a split turn.
+MAX_USER_PREFIX_TOKENS = MAX_CHUNK_TOKENS // 2
 
 
 def get_encoder():
@@ -31,9 +33,64 @@ def count_tokens(text: str) -> int:
     return len(encoder.encode(text))
 
 
+_FINER_SEPARATORS = ("\n", ". ", " ")
+
+
+def split_oversized(text: str, max_tokens: int, separators=_FINER_SEPARATORS) -> list[str]:
+    """Split one block of text into pieces of at most max_tokens.
+
+    Tries line breaks, then sentence ends, then spaces; text with none of
+    those (a minified blob, a base64 string) is cut by token count.
+    """
+    if count_tokens(text) <= max_tokens:
+        return [text]
+    for i, sep in enumerate(separators):
+        pieces = text.split(sep)
+        if len(pieces) == 1:
+            continue
+        sep_tokens = count_tokens(sep)
+        out: list[str] = []
+        current: list[str] = []
+        current_tokens = 0
+        for piece in pieces:
+            piece_tokens = count_tokens(piece)
+            added = piece_tokens + (sep_tokens if current else 0)
+            if current_tokens + added <= max_tokens:
+                current.append(piece)
+                current_tokens += added
+                continue
+            if current:
+                out.append(sep.join(current))
+            if piece_tokens <= max_tokens:
+                current, current_tokens = [piece], piece_tokens
+            else:
+                out.extend(split_oversized(piece, max_tokens, separators[i + 1:]))
+                current, current_tokens = [], 0
+        if current:
+            out.append(sep.join(current))
+        return out
+    return _cut_by_tokens(text, max_tokens)
+
+
+def _cut_by_tokens(text: str, max_tokens: int) -> list[str]:
+    encoder = get_encoder()
+    if encoder is None:
+        width = max_tokens * 4
+        return [text[i:i + width] for i in range(0, len(text), width)]
+    tokens = encoder.encode(text)
+    return [encoder.decode(tokens[i:i + max_tokens]) for i in range(0, len(tokens), max_tokens)]
+
+
 def split_text_at_paragraphs(text: str, max_tokens: int, overlap_ratio: float = OVERLAP_RATIO) -> list[str]:
-    """Split text at paragraph boundaries with overlap."""
-    paragraphs = text.split("\n\n")
+    """Split text at paragraph boundaries with overlap.
+
+    A paragraph longer than max_tokens is split further by split_oversized().
+    """
+    paragraphs = [
+        piece
+        for para in text.split("\n\n")
+        for piece in split_oversized(para, max_tokens)
+    ]
     chunks = []
     current_parts = []
     current_tokens = 0
@@ -52,6 +109,8 @@ def split_text_at_paragraphs(text: str, max_tokens: int, overlap_ratio: float = 
                     break
                 overlap_parts.insert(0, p)
                 overlap_tokens += pt
+            if overlap_tokens + para_tokens > max_tokens:
+                overlap_parts, overlap_tokens = [], 0
             current_parts = overlap_parts
             current_tokens = overlap_tokens
 
@@ -162,24 +221,37 @@ def create_chunks(session_data: dict) -> list[dict]:
                 "token_estimate": token_count,
             })
         else:
-            # Split the assistant response
-            user_prefix = f"User: {turn['user_text']}\n\n"
-            user_tokens = count_tokens(user_prefix)
-            available = MAX_CHUNK_TOKENS - user_tokens
-            if available < 100:
-                available = MAX_CHUNK_TOKENS
+            user_text = turn["user_text"]
+            user_tokens = count_tokens(f"User: {user_text}\n\n")
+            if user_tokens > MAX_USER_PREFIX_TOKENS:
+                # A long prompt (a pasted document or log) gets chunks of its
+                # own; the assistant parts carry only its opening.
+                for part in split_text_at_paragraphs(user_text, MAX_CHUNK_TOKENS - 10):
+                    part_combined = f"User: {part}"
+                    chunks.append({
+                        "session_id": session_id,
+                        "user_content": part,
+                        "assistant_content": "",
+                        "combined_text": part_combined,
+                        "timestamp": turn["timestamp"],
+                        "turn_number": turn["turn_number"],
+                        "token_estimate": count_tokens(part_combined),
+                    })
+                user_text = split_oversized(user_text, MAX_USER_PREFIX_TOKENS - 10)[0]
+                user_tokens = count_tokens(f"User: {user_text}\n\n")
+            available = MAX_CHUNK_TOKENS - user_tokens - 5
 
             # Include tool summary in the first split part
             text_to_split = turn["assistant_text"]
             if turn["tool_summary"]:
                 text_to_split += f"\n{turn['tool_summary']}"
 
-            parts = split_text_at_paragraphs(text_to_split, available)
+            parts = split_text_at_paragraphs(text_to_split, available) if text_to_split.strip() else []
             for part in parts:
-                part_combined = f"User: {turn['user_text']}\n\nAssistant: {part}"
+                part_combined = f"User: {user_text}\n\nAssistant: {part}"
                 chunks.append({
                     "session_id": session_id,
-                    "user_content": turn["user_text"],
+                    "user_content": user_text,
                     "assistant_content": part,
                     "combined_text": part_combined,
                     "timestamp": turn["timestamp"],

@@ -9,10 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .db import fts_search, get_chunks_by_ids
 from .embedder import embed_query
-from .search import RRF_K, _build_session_filter, _expanded_search, reciprocal_rank_fusion
-from .vector_search import numpy_vector_search
+from .search import RRF_K, _session_filter_sql, fused_session_results
 
 OTAK_VENV_PYTHON = "/Users/stian/src/otak/.venv-otak/bin/python3"
 RESEARCH_INDEX_DB = Path("/Users/stian/src/otak/data/research_index.db")
@@ -61,6 +59,26 @@ else:
         return []
 
 
+def chat_candidates(
+    conn,
+    query: str,
+    query_embedding: list[float],
+    limit: int = 10,
+    project: str | None = None,
+    branch: str | None = None,
+    since: str | None = None,
+    before: str | None = None,
+    expand: bool = False,
+) -> list[dict]:
+    """Chat half of a cross search: best chunk per session, hybrid-search format."""
+    session_filter = _session_filter_sql(conn, project, branch, since, before)
+    fetch_limit = limit * 5
+    return fused_session_results(
+        conn, query, query_embedding, fetch_limit * 2, session_filter, expand,
+        fetch_limit=fetch_limit,
+    )
+
+
 def cross_search(
     conn,
     query: str,
@@ -70,59 +88,43 @@ def cross_search(
     since: str | None = None,
     before: str | None = None,
     expand: bool = False,
+    chat: tuple[list[dict], list[float]] | None = None,
 ) -> list[dict]:
     """Search both chat and research indices, merge with RRF.
 
-    Returns a unified list where each result has a 'source' field: 'chat' or 'research'.
+    `chat` is a precomputed (chat_candidates() result, query embedding) pair,
+    as returned by the daemon.  Returns a unified list where each result has
+    a 'source' field: 'chat' or 'research'.
     """
-    allowed_sessions = _build_session_filter(conn, project, branch, since, before)
-
     fetch_limit = limit * 5
-    query_embedding = embed_query(query)
-
-    # --- Chat search (vector + FTS, optionally with LLM expansion) ---
-    vec_results = numpy_vector_search(conn, query_embedding, limit=fetch_limit)
-    fts_results = fts_search(conn, query, limit=fetch_limit)
-
-    if expand:
-        chat_fused = _expanded_search(conn, query, vec_results, fts_results, fetch_limit)
+    if chat is None:
+        query_embedding = embed_query(query)
+        candidates = chat_candidates(
+            conn, query, query_embedding, limit, project, branch, since, before, expand
+        )
     else:
-        chat_fused = reciprocal_rank_fusion([vec_results, fts_results])
+        candidates, query_embedding = chat
 
-    top_ids = [cid for cid, _ in chat_fused[:fetch_limit * 2]]
-    chunks = get_chunks_by_ids(conn, top_ids)
-    chunk_map = {c["id"]: c for c in chunks}
-
-    # Build chat results (deduplicated by session)
-    chat_results = []
-    seen_sessions: set[str] = set()
-    for cid, score in chat_fused:
-        chunk = chunk_map.get(cid)
-        if chunk is None:
-            continue
-        sid = chunk["session_id"]
-        if allowed_sessions is not None and sid not in allowed_sessions:
-            continue
-        if sid in seen_sessions:
-            continue
-        seen_sessions.add(sid)
-        chat_results.append({
-            "score": score,
+    chat_results = [
+        {
+            "score": r["score"],
             "source": "chat",
-            "chat_source": chunk.get("source", "claude"),
-            "session_id": sid,
-            "native_session_id": chunk.get("native_session_id", sid),
-            "project_path": chunk["project_path"],
-            "slug": chunk["slug"],
-            "git_branch": chunk["git_branch"],
-            "user_content": chunk["user_content"],
-            "assistant_content": chunk["assistant_content"],
-            "timestamp": chunk["timestamp"],
-            "turn_number": chunk["turn_number"],
-            "message_count": chunk.get("message_count"),
-            "first_message_at": chunk.get("first_message_at"),
-            "last_message_at": chunk.get("last_message_at"),
-        })
+            "chat_source": r.get("source", "claude"),
+            "session_id": r["session_id"],
+            "native_session_id": r.get("native_session_id", r["session_id"]),
+            "project_path": r["project_path"],
+            "slug": r["slug"],
+            "git_branch": r["git_branch"],
+            "user_content": r["user_content"],
+            "assistant_content": r["assistant_content"],
+            "timestamp": r["timestamp"],
+            "turn_number": r["turn_number"],
+            "message_count": r.get("message_count"),
+            "first_message_at": r.get("first_message_at"),
+            "last_message_at": r.get("last_message_at"),
+        }
+        for r in candidates
+    ]
 
     # --- Research search ---
     research_raw = _search_research_index(query_embedding, limit=fetch_limit)

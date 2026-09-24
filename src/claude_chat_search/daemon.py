@@ -3,6 +3,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,9 +20,9 @@ from .db import (
     get_session,
     get_unembedded_chunks,
     init_db,
-    insert_chunks,
     insert_session,
     insert_subagent,
+    sync_session_chunks,
     update_session_fingerprint,
     update_session_git_remote,
 )
@@ -137,11 +138,8 @@ def index_single_session(conn, file_info: dict) -> bool:
     chunks = create_chunks(session_data)
 
     with write_transaction(conn):
-        if existing:
-            delete_session_data(conn, sid)
         insert_session(conn, session_data)
-        if chunks:
-            insert_chunks(conn, chunks)
+        sync_session_chunks(conn, sid, chunks)
 
     # Backfill git remote for this session's project
     project_path = file_info["project_path"]
@@ -366,6 +364,28 @@ def _truncate_log_if_needed():
     LOG_FILE.write_text("\n".join(kept) + "\n")
 
 
+def _start_search_server():
+    """Serve searches on the socket; the model and vectors load in the background."""
+    from .search_service import SearchServer
+
+    server = SearchServer()
+    try:
+        server.start()
+    except OSError:
+        logger.exception("Search socket unavailable; CLI searches run in-process")
+        return None
+
+    def warm_up():
+        try:
+            server.service.warm_up()
+            logger.info("Search server ready on %s", server.path)
+        except Exception:
+            logger.exception("Search server warm-up failed")
+
+    threading.Thread(target=warm_up, name="search-warm-up", daemon=True).start()
+    return server
+
+
 def run():
     """Main daemon loop (foreground). Suitable for launchd or direct invocation."""
     global _shutdown
@@ -404,6 +424,8 @@ def run():
 
     conn = get_connection()
     init_db(conn)
+
+    server = _start_search_server()
 
     # Startup catch-up
     if not _shutdown:
@@ -478,6 +500,9 @@ def run():
             if _shutdown:
                 break
             time.sleep(0.1)
+
+    if server is not None:
+        server.stop()
 
     # Final WAL checkpoint before exit
     wal_checkpoint(conn, "TRUNCATE")
