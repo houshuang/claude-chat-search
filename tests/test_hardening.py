@@ -335,5 +335,23 @@ class DaemonDeferralTests(TempIndexCase):
         self.assertIsNone(db.get_session(self.conn, "sess-1"))
 
 
+class FullReindexKeepsOrphanedSessionsTests(TempIndexCase):
+    def test_all_force_keeps_sessions_whose_transcript_is_gone(self):
+        self.add_session("on-disk", "/p", chunks=2)
+        self.add_session("gone", "/p", chunks=2)
+        on_disk = [{"session_id": "on-disk", "source": "claude", "path": self.root / "x.jsonl"}]
+        with patch.object(cli_module, "iter_conversation_files", return_value=on_disk), \
+                patch.object(cli_module, "_run_index"), patch.object(cli_module, "_run_embed"):
+            result = CliRunner().invoke(cli, ["index", "--all", "--force", "--source", "all"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("keeping 1 whose transcript is no longer on disk", result.output)
+        conn = db.get_connection()
+        remaining = {r[0] for r in conn.execute("SELECT session_id FROM sessions")}
+        chunks = conn.execute("SELECT COUNT(*) FROM chunks WHERE session_id = 'gone'").fetchone()[0]
+        conn.close()
+        self.assertEqual(remaining, {"gone"})
+        self.assertEqual(chunks, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

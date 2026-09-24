@@ -711,6 +711,8 @@ def get_indexed_sessions(conn: apsw.Connection, source: str | None = None) -> di
 
 
 def get_session_ids_by_source(conn: apsw.Connection, source: str) -> list[str]:
+    if source == "all":
+        return [row[0] for row in conn.execute("SELECT session_id FROM sessions")]
     return [row[0] for row in conn.execute(
         "SELECT session_id FROM sessions WHERE source = ?", (source,)
     )]
