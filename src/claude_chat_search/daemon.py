@@ -11,6 +11,7 @@ import apsw
 
 from .chunker import create_chunks
 from .db import (
+    BUSY_TIMEOUT_MS,
     write_transaction,
     DB_DIR,
     delete_session_data,
@@ -309,13 +310,22 @@ def run_embeddings(conn):
                                len(skipped), skipped)
 
 
-def wal_checkpoint(conn):
-    """Run a WAL checkpoint to prevent unbounded WAL growth."""
+def wal_checkpoint(conn, mode: str = "PASSIVE", busy_ms: int = 1000):
+    """Checkpoint the WAL without stalling other writers.
+
+    PASSIVE never waits. TRUNCATE (used at shutdown) holds the write lock while
+    it waits for readers, which blocks every other writer for that long, so it
+    gets a short busy timeout of its own.
+    """
+    conn.setbusytimeout(busy_ms)
     try:
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        logger.debug("WAL checkpoint completed")
+        busy, log_frames, done = conn.execute(f"PRAGMA wal_checkpoint({mode})").fetchone()
+        logger.debug("WAL checkpoint %s: busy=%s log=%s checkpointed=%s",
+                     mode, busy, log_frames, done)
     except Exception:
         logger.exception("WAL checkpoint failed")
+    finally:
+        conn.setbusytimeout(BUSY_TIMEOUT_MS)
 
 
 def is_running() -> int | None:
@@ -470,7 +480,7 @@ def run():
             time.sleep(0.1)
 
     # Final WAL checkpoint before exit
-    wal_checkpoint(conn)
+    wal_checkpoint(conn, "TRUNCATE")
     conn.close()
     try:
         PID_FILE.unlink()

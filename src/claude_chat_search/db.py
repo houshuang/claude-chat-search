@@ -9,6 +9,8 @@ import sqlite_vec
 
 from .paths import DATA_DIR
 
+BUSY_TIMEOUT_MS = 30000
+
 _configured_db_path = os.environ.get("CHAT_SEARCH_DB_PATH")
 DB_PATH = (
     Path(_configured_db_path).expanduser()
@@ -56,14 +58,14 @@ def get_connection(readonly: bool = False) -> apsw.Connection:
     if readonly:
         conn = apsw.Connection(str(DB_PATH), flags=apsw.SQLITE_OPEN_READONLY)
         _load_vec(conn)
-        conn.setbusytimeout(30000)
+        conn.setbusytimeout(BUSY_TIMEOUT_MS)
         conn.execute("PRAGMA cache_size=-64000")
         return conn
 
     DB_DIR.mkdir(parents=True, exist_ok=True)
     conn = apsw.Connection(str(DB_PATH))
     _load_vec(conn)
-    conn.setbusytimeout(30000)
+    conn.setbusytimeout(BUSY_TIMEOUT_MS)
     try:
         conn.execute("PRAGMA journal_mode=WAL")
     except apsw.CantOpenError:
