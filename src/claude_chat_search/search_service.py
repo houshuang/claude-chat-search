@@ -90,6 +90,7 @@ class SearchService:
     def __init__(self):
         self._conn = None
         self._lock = threading.Lock()
+        self.ready = threading.Event()
 
     def _connection(self):
         if self._conn is None:
@@ -103,6 +104,7 @@ class SearchService:
         embed_query("warm up")
         with self._lock:
             _cache.refresh(self._connection())
+        self.ready.set()
 
     def handle(self, message: dict) -> dict:
         if message.get("v") != PROTOCOL_VERSION:
@@ -110,7 +112,11 @@ class SearchService:
         op = message.get("op")
         args = message.get("args") or {}
         if op == "ping":
-            return {"ok": True}
+            return {"ok": True, "ready": self.ready.is_set()}
+        if not self.ready.is_set():
+            # The model loads after the startup scan; answering "not ready" lets
+            # the CLI search in-process instead of waiting up to a minute.
+            return {"ok": False, "error": "warming up"}
         if op == "search":
             kwargs = _search_kwargs(args)
             kwargs["do_rerank"] = bool(args.get("rerank"))
