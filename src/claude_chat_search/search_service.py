@@ -20,6 +20,7 @@ import socket
 import socketserver
 import stat
 import threading
+import time
 
 from . import db
 
@@ -99,12 +100,25 @@ class SearchService:
 
     def warm_up(self) -> None:
         from .embedder import embed_query
-        from .vector_search import _cache
+        from .vector_search import MIN_REFRESH_INTERVAL, _cache
 
         embed_query("warm up")
-        with self._lock:
-            _cache.refresh(self._connection())
+        # The cache is refreshed on its own connection and thread, so a search
+        # never waits for a refresh: it uses the copy that is current.
+        refresh_conn = db.get_read_connection()
+        _cache.refresh(refresh_conn)
+        _cache.background_refresh = True
         self.ready.set()
+
+        def keep_fresh():
+            while True:
+                time.sleep(MIN_REFRESH_INTERVAL)
+                try:
+                    _cache.refresh(refresh_conn)
+                except Exception:
+                    logger.exception("Vector cache refresh failed")
+
+        threading.Thread(target=keep_fresh, name="vector-cache-refresh", daemon=True).start()
 
     def handle(self, message: dict) -> dict:
         if message.get("v") != PROTOCOL_VERSION:

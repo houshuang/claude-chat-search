@@ -42,6 +42,8 @@ class VectorCache:
         self._stale = True
         self._synced_at = 0.0
         self._lock = threading.Lock()
+        # Set by the daemon, which refreshes from a background thread.
+        self.background_refresh = False
 
     def invalidate(self) -> None:
         self._stale = True
@@ -68,6 +70,9 @@ class VectorCache:
         if model != self._model:
             self.state = _empty_state()
             self._model = model
+        old_ids = self.state[0]
+        if len(old_ids) and self._append_only(conn, old_ids):
+            return
         # Served from the covering (session_id, embedded) index; an ORDER BY
         # id here would read the whole chunks table instead.
         rows = conn.execute(
@@ -101,6 +106,41 @@ class VectorCache:
         # A chunk marked embedded whose vector is missing is left out.
         present = np.isin(ids, all_ids, assume_unique=True)
         self.state = (all_ids, all_matrix, sessions[present])
+
+    def _append_only(self, conn, old_ids) -> bool:
+        """Add vectors for chunks newer than the cache without re-reading every id.
+
+        New chunks get higher ids. When the embedded count equals the cached rows
+        plus the newer ones, nothing was deleted or re-marked, so appending them
+        is exact; otherwise the caller falls back to the full sync.
+        """
+        top = int(old_ids[-1])
+        total = conn.execute("SELECT COUNT(*) FROM chunks WHERE embedded = 1").fetchone()[0]
+        rows = conn.execute(
+            "SELECT id, session_id FROM chunks WHERE embedded = 1 AND id > ?", (top,)
+        ).fetchall()
+        if total != len(old_ids) + len(rows):
+            return False
+        if not rows:
+            return True
+        for _cid, sid in rows:
+            if sid not in self.session_codes:
+                self.session_codes[sid] = len(self.session_codes)
+        ids = np.array(sorted(r[0] for r in rows), dtype=np.int64)
+        by_id = {r[0]: self.session_codes[r[1]] for r in rows}
+        new_ids, new_matrix = self._read_vectors(conn, ids, full=False)
+        if len(new_ids) != len(ids):
+            return False
+        order = np.argsort(new_ids, kind="stable")
+        new_ids, new_matrix = new_ids[order], new_matrix[order]
+        old_ids, old_matrix, old_sessions = self.state
+        sessions = np.array([by_id[int(i)] for i in new_ids], dtype=np.int32)
+        self.state = (
+            np.concatenate([old_ids, new_ids]),
+            np.vstack([old_matrix, new_matrix]),
+            np.concatenate([old_sessions, sessions]),
+        )
+        return True
 
     @staticmethod
     def _read_vectors(conn, wanted: np.ndarray, full: bool):
@@ -176,7 +216,8 @@ def numpy_vector_search(
 
     Returns results in the same format as db.vector_search.
     """
-    _cache.refresh(conn)
+    if not _cache.background_refresh:
+        _cache.refresh(conn)
     return _cache.search(query_embedding, limit, allowed_sessions)
 
 
