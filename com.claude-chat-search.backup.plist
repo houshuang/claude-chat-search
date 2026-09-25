@@ -11,7 +11,7 @@
         <string>claude_chat_search.cli</string>
         <string>backup</string>
         <string>--keep</string>
-        <string>4</string>
+        <string>2</string>
     </array>
     <key>StartCalendarInterval</key>
     <dict>

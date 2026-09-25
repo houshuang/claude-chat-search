@@ -1,5 +1,7 @@
 # claude-chat-search
 
+Changes and upgrade notes: [CHANGELOG.md](CHANGELOG.md).
+
 Semantic search over your past Claude Code and Codex conversations. Indexes the JSONL conversation logs in `~/.claude/projects/`, `~/.codex/sessions/`, and `~/.codex/archived_sessions/` into a local SQLite database with hybrid search — full-text keyword search (FTS5) and vector similarity search (via [limbic](https://github.com/houshuang/limbic)), combined using Reciprocal Rank Fusion.
 
 Codex indexing is deliberately conversation-only: visible user and agent messages are indexed. Developer/system prompts, context Codex injects into user messages (`AGENTS.md`, `<environment_context>`, `<user_instructions>` and similar blocks), reasoning, tool calls, tool outputs, token accounting, world state, and Codex subagent rollouts are excluded.
@@ -96,11 +98,11 @@ Options:
 
 Filters are applied while candidates are selected, in both the vector and the keyword ranking, so a narrow filter returns the best matches inside it rather than whatever survived a global top-k.
 
-When the daemon is running, `search`, `resume` and the chat half of `cross` are answered by it over a unix socket (`search.sock` in the index directory, mode 0600). It keeps the embedding model and all vectors in memory, so a search takes a fraction of a second instead of the 8–11 seconds a cold process needs to load them. Without a daemon the CLI searches in-process as before. Entries in `search.log` served by the daemon carry `"daemon": true`.
+When the daemon is running, `search`, `resume` and the chat half of `cross` are answered by it over a unix socket (`search.sock` in the index directory, mode 0600). It keeps the embedding model and all vectors in memory, so a search takes a fraction of a second instead of the 9–12 seconds a cold process needs to load them. Without a daemon the CLI searches in-process as before. Entries in `search.log` served by the daemon carry `"daemon": true`.
 
 Right after the daemon starts it spends up to a minute on its startup scan and loading the model; until it is ready it answers "not ready" and the CLI searches in-process, so a search never hangs on a warming daemon. The daemon's copy of the vectors is refreshed at most every 30 seconds, so a chunk embedded in the last half minute may be missing from vector results (keyword search sees it at once).
 
-Measured on a 1.4 GB index (5.7k sessions, 114k chunks, granite-311m): median 0.2 s and p90 0.37 s per search through the daemon, against 8–11 s (p90 25 s) for a cold process.
+Measured on a 1.4 GB index (5.7k sessions, 114k chunks, granite-311m): median 0.2 s and p90 0.37 s per search through the daemon, against 9–12 s for a cold process.
 
 ### Embedding model
 
@@ -120,12 +122,12 @@ It backs up the index, re-chunks every session with the current chunker (from th
 
 ```bash
 claude-chat-search backup
-claude-chat-search backup --keep 4
+claude-chat-search backup --keep 2
 ```
 
 Creates a consistent online SQLite backup under `~/.claude-chat-search/backups/`, runs `PRAGMA integrity_check` on the copy, and prints its SHA-256 checksum. If the check fails, the copy is renamed `*.failed-integrity`, nothing is pruned, and the command exits non-zero. `--keep N` then deletes all but the newest N `index-*.db` backups in that directory. The backup command intentionally performs no schema migration.
 
-A weekly backup job (Sundays 04:30, keeping four) is included. Like the other plists it contains the author's paths; edit the Python path and log paths first:
+A weekly backup job (Sundays 04:30, keeping two) is included. Keep backups even though the index looks derived: Claude Code deletes old transcripts, so for older sessions the index is the only copy. Like the other plists it contains the author's paths; edit the Python path and log paths first:
 
 ```bash
 cp com.claude-chat-search.backup.plist ~/Library/LaunchAgents/
