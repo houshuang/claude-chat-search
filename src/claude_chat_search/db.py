@@ -1,6 +1,9 @@
 import hashlib
+import logging
 import os
 import struct
+import sys
+import time
 from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -10,6 +13,11 @@ import apsw
 import sqlite_vec
 
 from .models import LEGACY_MODEL, MODELS, configured_model
+
+logger = logging.getLogger(__name__)
+
+SLOW_LOCK_WAIT_S = 5.0
+SLOW_LOCK_HOLD_S = 2.0
 from .paths import DATA_DIR
 
 BUSY_TIMEOUT_MS = 30000
@@ -52,13 +60,20 @@ def write_transaction(conn: apsw.Connection):
         with conn:
             yield
         return
+    started = time.monotonic()
     conn.execute("BEGIN IMMEDIATE")
+    acquired = time.monotonic()
     try:
         yield
     except BaseException:
         conn.execute("ROLLBACK")
         raise
     conn.execute("COMMIT")
+    waited, held = acquired - started, time.monotonic() - acquired
+    if waited > SLOW_LOCK_WAIT_S or held > SLOW_LOCK_HOLD_S:
+        caller = sys._getframe(2).f_code.co_name
+        logger.warning("Slow write transaction in %s (pid %d): waited %.1fs, held %.1fs",
+                       caller, os.getpid(), waited, held)
 
 
 def get_connection(readonly: bool = False) -> apsw.Connection:

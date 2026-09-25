@@ -3,7 +3,10 @@ from __future__ import annotations
 import fcntl
 import logging
 import threading
+import time
 from contextlib import contextmanager
+
+import apsw
 
 from . import db
 from .db import embedding_mismatch, get_unembedded_chunks, insert_embeddings, mark_embedding_failed
@@ -23,7 +26,11 @@ _spec: ModelSpec | None = None
 # embeddings for socket searches and background chunk embedding share one
 # model; ENCODE_BATCH bounds how long a query waits behind a chunk batch.
 _model_lock = threading.RLock()
-ENCODE_BATCH = 16
+# Searches waiting for the model. The lock is not fair, so background embedding
+# would otherwise re-take it between batches and keep a search waiting.
+_queries_waiting = 0
+_queries_waiting_lock = threading.Lock()
+ENCODE_BATCH = 8
 
 
 @contextmanager
@@ -67,13 +74,16 @@ def _get_model():
         return _model, _spec
 
 
-def _encode(model, texts: list[str], show_progress: bool = False):
+def _encode(model, texts: list[str], show_progress: bool = False, background: bool = False):
     import numpy as np
     # Batches of similar length pad less; results go back in input order.
     order = sorted(range(len(texts)), key=lambda i: len(texts[i]))
     vecs = []
     for start in range(0, len(order), ENCODE_BATCH):
         batch = [texts[i] for i in order[start:start + ENCODE_BATCH]]
+        if background:
+            while _queries_waiting:
+                time.sleep(0.005)
         with _model_lock:
             vecs.append(model.encode(
                 batch, batch_size=ENCODE_BATCH,
@@ -91,13 +101,21 @@ def _encode(model, texts: list[str], show_progress: bool = False):
 def embed_texts(texts: list[str], show_progress: bool = False) -> list[list[float]]:
     """Embed chunk texts as documents."""
     model, spec = _get_model()
-    return _encode(model, [spec.document_prompt + t for t in texts], show_progress).tolist()
+    return _encode(model, [spec.document_prompt + t for t in texts], show_progress,
+                   background=True).tolist()
 
 
 def embed_query(text: str) -> list[float]:
     """Embed a search query, with the model's query prompt."""
+    global _queries_waiting
     model, spec = _get_model()
-    return _encode(model, [spec.query_prompt + text])[0].tolist()
+    with _queries_waiting_lock:
+        _queries_waiting += 1
+    try:
+        return _encode(model, [spec.query_prompt + text])[0].tolist()
+    finally:
+        with _queries_waiting_lock:
+            _queries_waiting -= 1
 
 
 def process_embeddings(conn, callback=None) -> int:
@@ -138,8 +156,26 @@ def embed_rows(conn, rows: list[dict]) -> tuple[int, list[int]]:
         stored_a, skipped_a = embed_rows(conn, rows[:middle])
         stored_b, skipped_b = embed_rows(conn, rows[middle:])
         return stored_a + stored_b, skipped_a + skipped_b
-    insert_embeddings(conn, [r["id"] for r in rows], embeddings)
+    _store_with_retry(conn, [r["id"] for r in rows], embeddings)
     return len(rows), []
+
+
+STORE_ATTEMPTS = 5
+
+
+def _store_with_retry(conn, chunk_ids, embeddings) -> None:
+    # The vectors are already computed; a writer that holds the lock past the
+    # busy timeout should delay this batch, not throw the work away.
+    for attempt in range(1, STORE_ATTEMPTS + 1):
+        try:
+            insert_embeddings(conn, chunk_ids, embeddings)
+            return
+        except apsw.BusyError:
+            if attempt == STORE_ATTEMPTS:
+                raise
+            logger.warning("Database locked while storing %d embeddings; retry %d of %d",
+                           len(chunk_ids), attempt, STORE_ATTEMPTS - 1)
+            time.sleep(5 * attempt)
 
 
 def _process_embeddings_locked(conn, callback=None) -> int:

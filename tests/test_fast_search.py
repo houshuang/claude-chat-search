@@ -203,6 +203,34 @@ class VectorCacheTests(FastSearchCase):
         reads.assert_not_called()
         self.assertIs(cache.state[1], matrix)
 
+    def test_new_chunks_are_appended_without_a_full_resync(self):
+        first = self.add("s1", "/p", [("one", unit(0)), ("two", unit(1))])
+        reader = db.get_read_connection()
+        self.addCleanup(reader.close)
+        cache = vector_search.VectorCache()
+        cache.refresh(reader)
+        new = self.add("s2", "/p", [("three", unit(2))])
+        with patch.object(cache, "_read_vectors", wraps=cache._read_vectors) as reads:
+            cache._sync(reader)
+        self.assertEqual(reads.call_count, 1)
+        self.assertEqual(reads.call_args.args[1].tolist(), new)
+        self.assertEqual(cache.state[0].tolist(), first + new)
+        self.assertEqual(cache.search(unit(2), 1)[0]["chunk_id"], new[0])
+        self.assertEqual(
+            [r["chunk_id"] for r in cache.search(unit(0), 5, allowed_sessions={"s2"})], new)
+
+    def test_a_deleted_chunk_forces_the_full_resync(self):
+        ids = self.add("s1", "/p", [("one", unit(0)), ("two", unit(1))])
+        reader = db.get_read_connection()
+        self.addCleanup(reader.close)
+        cache = vector_search.VectorCache()
+        cache.refresh(reader)
+        with db.write_transaction(self.conn):
+            self.conn.execute("DELETE FROM vec_chunks WHERE chunk_id = ?", (ids[0],))
+            self.conn.execute("DELETE FROM chunks WHERE id = ?", (ids[0],))
+        cache._sync(reader)
+        self.assertEqual(cache.state[0].tolist(), [ids[1]])
+
     def test_search_within_allowed_sessions(self):
         self.add("near", "/p", [("a", unit(0))])
         far = self.add("far", "/p", [("b", blend(0, 1, 0.1))])
@@ -307,6 +335,9 @@ class SearchServiceTests(FastSearchCase):
         self.embed = patch.object(search, "embed_query", return_value=unit(0))
         self.embed.start()
         self.addCleanup(self.embed.stop)
+        connect = patch.object(search_service, "CONNECT_TIMEOUT", 5.0)
+        connect.start()
+        self.addCleanup(connect.stop)
         self.server = search_service.SearchServer()
         self.server.start()
         self.addCleanup(self.server.stop)
