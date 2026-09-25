@@ -1,6 +1,6 @@
 [project]
 name = "claude-chat-search"
-version = "0.1.0"
+version = "0.2.0"
 description = "Semantic search over Claude Code and Codex conversations"
 requires-python = ">=3.11"
 dependencies = [
