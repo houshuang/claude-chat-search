@@ -18,10 +18,22 @@
     <true/>
     <key>ThrottleInterval</key>
     <integer>10</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>Nice</key>
+    <integer>10</integer>
+    <key>LowPriorityIO</key>
+    <true/>
     <key>EnvironmentVariables</key>
     <dict>
         <key>TOKENIZERS_PARALLELISM</key>
         <string>false</string>
+        <key>OMP_NUM_THREADS</key>
+        <string>2</string>
+        <key>MKL_NUM_THREADS</key>
+        <string>2</string>
+        <key>VECLIB_MAXIMUM_THREADS</key>
+        <string>2</string>
     </dict>
     <key>StandardOutPath</key>
     <string>/Users/stian/.claude-chat-search/daemon-stdout.log</string>

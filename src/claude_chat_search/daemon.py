@@ -44,15 +44,25 @@ PID_FILE = DB_DIR / "daemon.pid"
 LOG_FILE = DB_DIR / "daemon.log"
 POLL_INTERVAL = 2
 BUSY_RETRY_SECONDS = 30
-COOLDOWN_SECONDS = 60
-ACTIVE_COOLDOWN_SECONDS = 300  # 5 min for sessions that keep changing
-EMBED_INTERVAL = 30
+# Re-indexing re-parses the whole transcript, so an active session is indexed
+# at most every 10 minutes, or every 30 once it has been re-indexed 3 times
+# within an hour.  Search lags behind; the CPU is left for the sessions.
+COOLDOWN_SECONDS = 600
+ACTIVE_COOLDOWN_SECONDS = 1800
+REINDEX_WINDOW = 3600
+EMBED_INTERVAL = 600
 SCAN_INTERVAL = 3600  # hourly fingerprint scan catches transcripts no hook queued
+# While the 1-minute load average exceeds the core count, indexing and
+# embedding wait, but never for longer than MAX_BUSY_POSTPONE.
+MAX_BUSY_POSTPONE = 3600
 WAL_CHECKPOINT_INTERVAL = 600  # 10 minutes
 CODE_CHECK_INTERVAL = 300  # 5 min — exit if source code changed (launchd restarts)
+# Past this footprint the daemon exits and launchd restarts it fresh: the
+# allocators keep memory from earlier peaks that a long-running daemon never
+# gets back otherwise.
+MAX_FOOTPRINT_BYTES = 4 * 1024 ** 3
 LOG_MAX_BYTES = 1_000_000  # 1MB — truncate daemon.log on startup if larger
 LOG_KEEP_LINES = 1000
-REINDEX_WINDOW = 600  # 10 min window for counting re-indexes
 REPO_DIR = Path(__file__).resolve().parent.parent.parent  # project root
 
 logger = logging.getLogger("claude-chat-search-daemon")
@@ -284,7 +294,7 @@ def full_scan(conn) -> int:
 def run_embeddings(conn):
     """Run embedding pipeline in batches, checking shutdown between batches."""
     from .db import embedding_mismatch
-    from .embedder import EmbeddingUnavailable, embed_rows, embedding_lock
+    from .embedder import EmbeddingUnavailable, embed_rows, embedding_lock, release_gpu_cache
 
     mismatch = embedding_mismatch(conn)
     if mismatch:
@@ -296,11 +306,13 @@ def run_embeddings(conn):
             logger.info("Embedding pass skipped: another indexer holds the lock")
             return
 
+        embedded_any = False
         while not _shutdown:
             rows = get_unembedded_chunks(conn, 256)
             if not rows:
                 break
 
+            embedded_any = True
             try:
                 _stored, skipped = embed_rows(conn, rows)
             except EmbeddingUnavailable:
@@ -312,6 +324,38 @@ def run_embeddings(conn):
             if skipped:
                 logger.warning("Skipped %d chunk(s) that cannot be embedded: %s",
                                len(skipped), skipped)
+        if embedded_any:
+            release_gpu_cache()
+
+
+def system_busy() -> bool:
+    """True when the machine has more runnable work than cores."""
+    try:
+        return os.getloadavg()[0] > (os.cpu_count() or 1)
+    except OSError:
+        return False
+
+
+def phys_footprint() -> int | None:
+    """This process's physical footprint in bytes (what Activity Monitor shows).
+
+    RSS undercounts it: memory swapped or compressed out, and GPU memory, still
+    count against the footprint.  None where it cannot be read.
+    """
+    if sys.platform != "darwin":
+        return None
+    import ctypes
+
+    # rusage_info_v2: 16-byte uuid, then uint64 fields; ri_phys_footprint is
+    # the eighth of them.
+    info = (ctypes.c_uint64 * 32)()
+    try:
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
+        if libproc.proc_pid_rusage(os.getpid(), 2, ctypes.byref(info)) != 0:
+            return None
+    except (OSError, AttributeError):
+        return None
+    return int(info[2 + 7])
 
 
 def wal_checkpoint(conn, mode: str = "PASSIVE", busy_ms: int = 1000):
@@ -460,16 +504,21 @@ def run():
     last_wal_checkpoint = time.monotonic()
     last_code_check = time.monotonic()
     last_scan = time.monotonic()
+    last_work = time.monotonic()
 
     while not _shutdown:
-        try:
-            indexed = process_queue(conn) + process_deferred(conn)
-            if indexed > 0:
-                logger.info(f"Queue batch: indexed {indexed} sessions")
-        except Exception:
-            logger.exception("Error processing queue")
+        # The queue file keeps collecting paths while work is postponed.
+        postpone = system_busy() and time.monotonic() - last_work < MAX_BUSY_POSTPONE
+        if not postpone:
+            last_work = time.monotonic()
+            try:
+                indexed = process_queue(conn) + process_deferred(conn)
+                if indexed > 0:
+                    logger.info(f"Queue batch: indexed {indexed} sessions")
+            except Exception:
+                logger.exception("Error processing queue")
 
-        if time.monotonic() - last_scan >= SCAN_INTERVAL:
+        if not postpone and time.monotonic() - last_scan >= SCAN_INTERVAL:
             try:
                 count = full_scan(conn)
                 if count:
@@ -480,7 +529,7 @@ def run():
 
         # Run embeddings on a separate timer, independent of indexing
         now = time.monotonic()
-        if now - last_embed_time >= EMBED_INTERVAL:
+        if not postpone and now - last_embed_time >= EMBED_INTERVAL:
             try:
                 run_embeddings(conn)
             except Exception:
@@ -493,12 +542,17 @@ def run():
             wal_checkpoint(conn)
             last_wal_checkpoint = time.monotonic()
 
-        # Exit if source code changed — launchd will restart with new code
-        if startup_commit and now - last_code_check >= CODE_CHECK_INTERVAL:
-            current = _get_git_commit()
+        # Exit if source code changed or memory grew — launchd restarts us
+        if now - last_code_check >= CODE_CHECK_INTERVAL:
+            current = _get_git_commit() if startup_commit else None
             if current and current != startup_commit:
                 logger.info("Code changed (%s -> %s), exiting for restart",
                             startup_commit[:8], current[:8])
+                break
+            footprint = phys_footprint()
+            if footprint is not None and footprint > MAX_FOOTPRINT_BYTES:
+                logger.info("Footprint %d MB exceeds %d MB, exiting for restart",
+                            footprint >> 20, MAX_FOOTPRINT_BYTES >> 20)
                 break
             last_code_check = time.monotonic()
 

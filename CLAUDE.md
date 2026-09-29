@@ -6,7 +6,7 @@ Semantic search over Claude Code and Codex conversations. Indexes JSONL conversa
 
 - `db.py` — SQLite schema, CRUD, vector/FTS search. Uses APSW + sqlite-vec extension.
 - `cli.py` — Click CLI: `init`, `index`, `search`, `daemon start/stop`, etc.
-- `daemon.py` — Background process that indexes queued conversations, defers work that arrives during a session's cooldown, and rescans fingerprints hourly.
+- `daemon.py` — Background process that indexes queued conversations, defers work that arrives during a session's cooldown, and rescans fingerprints hourly. It postpones indexing and embedding while the load average exceeds the core count (at most an hour), and exits for a launchd restart when its memory footprint passes `MAX_FOOTPRINT_BYTES`.
 - `parser.py` — Parses Claude Code JSONL conversation files, extracts metadata.
 - `codex_parser.py` — Parses only visible conversation from Codex rollout files; excludes system/developer prompts, reasoning, tools, outputs, state, and subagent rollouts.
 - `sources.py` — Source-neutral discovery/parser dispatch.

@@ -74,6 +74,22 @@ def _get_model():
         return _model, _spec
 
 
+def release_gpu_cache() -> None:
+    """Return the GPU allocator's cached blocks to the system.
+
+    PyTorch keeps the memory of its largest batches for reuse; batches padded
+    to 1024 tokens would otherwise stay held between embedding passes.
+    """
+    with _model_lock:
+        if _model is None:
+            return
+        import torch
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        elif torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
 def _encode(model, texts: list[str], show_progress: bool = False, background: bool = False):
     import numpy as np
     # Batches of similar length pad less; results go back in input order.
