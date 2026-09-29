@@ -7,7 +7,7 @@
 - The daemon runs as a background process (`ProcessType Background`, `Nice 10`, low-priority I/O, two math threads). Reload its plist to apply this: `launchctl bootout gui/$(id -u)/com.claude-chat-search.daemon`, copy the plist to `~/Library/LaunchAgents/`, then `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.claude-chat-search.daemon.plist`.
 - A changing session is re-indexed at most every 10 minutes (30 once it keeps changing), new chunks are embedded every 10 minutes, and the search server refreshes its vectors every 5 minutes. New conversation turns take up to about 20 minutes to become searchable.
 - While the 1-minute load average exceeds the number of cores, indexing and embedding wait, for at most an hour.
-- After each embedding pass the GPU allocator's cached memory is released, and the daemon restarts itself when its footprint passes 4 GB.
+- After each embedding pass the GPU allocator's cached memory is released, and under launchd (which sets `CLAUDE_CHAT_SEARCH_SUPERVISED=1`) the daemon restarts itself when its footprint passes 4 GB. The startup scan also waits for the load to drop.
 
 ## 0.2.0 — 2026-09-25
 

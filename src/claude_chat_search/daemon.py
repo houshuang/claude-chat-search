@@ -477,6 +477,11 @@ def run():
 
     server = _start_search_server()
 
+    # Restarts land here too, so the catch-up waits for load like the loop does.
+    busy_until = time.monotonic() + MAX_BUSY_POSTPONE
+    while not _shutdown and system_busy() and time.monotonic() < busy_until:
+        time.sleep(POLL_INTERVAL)
+
     # Startup catch-up
     if not _shutdown:
         logger.info("Running startup full scan...")
@@ -505,6 +510,8 @@ def run():
     last_code_check = time.monotonic()
     last_scan = time.monotonic()
     last_work = time.monotonic()
+    # Set by the launchd plist, whose KeepAlive restarts a daemon that exits.
+    supervised = os.environ.get("CLAUDE_CHAT_SEARCH_SUPERVISED") == "1"
 
     while not _shutdown:
         # The queue file keeps collecting paths while work is postponed.
@@ -549,7 +556,7 @@ def run():
                 logger.info("Code changed (%s -> %s), exiting for restart",
                             startup_commit[:8], current[:8])
                 break
-            footprint = phys_footprint()
+            footprint = phys_footprint() if supervised else None
             if footprint is not None and footprint > MAX_FOOTPRINT_BYTES:
                 logger.info("Footprint %d MB exceeds %d MB, exiting for restart",
                             footprint >> 20, MAX_FOOTPRINT_BYTES >> 20)

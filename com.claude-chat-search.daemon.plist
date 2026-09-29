@@ -28,6 +28,8 @@
     <dict>
         <key>TOKENIZERS_PARALLELISM</key>
         <string>false</string>
+        <key>CLAUDE_CHAT_SEARCH_SUPERVISED</key>
+        <string>1</string>
         <key>OMP_NUM_THREADS</key>
         <string>2</string>
         <key>MKL_NUM_THREADS</key>
