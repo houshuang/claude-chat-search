@@ -17,7 +17,9 @@ from .db import stored_embedding_model
 _READ_BATCH = 500
 
 
-MIN_REFRESH_INTERVAL = 30.0
+# Each refresh after a re-index can re-read every chunk id; embeddings only
+# land every EMBED_INTERVAL anyway.
+MIN_REFRESH_INTERVAL = 300.0
 
 
 def _empty_state():

@@ -353,5 +353,25 @@ class FullReindexKeepsOrphanedSessionsTests(TempIndexCase):
         self.assertEqual(chunks, 2)
 
 
+class DaemonResourceTests(unittest.TestCase):
+    @unittest.skipUnless(daemon.sys.platform == "darwin", "reads macOS rusage")
+    def test_footprint_is_read_in_bytes(self):
+        footprint = daemon.phys_footprint()
+        self.assertIsNotNone(footprint)
+        self.assertGreater(footprint, 1 << 20)
+        self.assertLess(footprint, daemon.MAX_FOOTPRINT_BYTES)
+
+    def test_busy_when_load_exceeds_cores(self):
+        with patch.object(daemon.os, "cpu_count", return_value=4):
+            with patch.object(daemon.os, "getloadavg", return_value=(4.5, 0, 0)):
+                self.assertTrue(daemon.system_busy())
+            with patch.object(daemon.os, "getloadavg", return_value=(3.5, 0, 0)):
+                self.assertFalse(daemon.system_busy())
+
+    def test_releasing_gpu_cache_before_the_model_loads_is_a_no_op(self):
+        with patch.object(embedder, "_model", None):
+            embedder.release_gpu_cache()
+
+
 if __name__ == "__main__":
     unittest.main()
