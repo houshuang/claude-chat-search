@@ -292,6 +292,7 @@ def search(
 
     mode = "file" if file_mode else "grep" if grep_mode else "hybrid"
     served_by_daemon = False
+    _warn_if_index_lagging()
     t0 = _time.monotonic()
 
     if file_mode:
@@ -588,6 +589,43 @@ def _warn_if_semantic_limited(conn) -> None:
             f"Note: embedding migration in progress ({stats['embedded']}/{stats['chunks']} "
             "chunks embedded); semantic results are incomplete.", err=True,
         )
+
+
+INDEX_LAG_WARN_SECONDS = 900
+
+
+def index_lag_warning(now: float | None = None) -> str | None:
+    """Describe a stalled indexer when conversations are waiting in its queue."""
+    from .daemon import HEARTBEAT_FILE, QUEUE_PATH
+
+    try:
+        pending = {line.strip() for line in QUEUE_PATH.read_text().splitlines() if line.strip()}
+    except OSError:
+        return None
+    if not pending:
+        return None
+    try:
+        processed_at = float(json.loads(HEARTBEAT_FILE.read_text())["queue_processed_at"])
+    except (OSError, ValueError, KeyError, TypeError):
+        processed_at = None
+    now = _time.time() if now is None else now
+    if processed_at is not None and now - processed_at < INDEX_LAG_WARN_SECONDS:
+        return None
+    since = (
+        f"since {datetime.fromtimestamp(processed_at).strftime('%Y-%m-%d %H:%M')}"
+        if processed_at is not None else "recently"
+    )
+    return (
+        f"the indexer has not processed new conversations {since} "
+        f"({len(pending)} waiting), so recent sessions may be missing. "
+        "Search their transcripts directly: grep -l 'TEXT' ~/.claude/projects/*/*.jsonl"
+    )
+
+
+def _warn_if_index_lagging() -> None:
+    warning = index_lag_warning()
+    if warning:
+        click.echo(f"Warning: {warning}", err=True)
 
 
 def _read_connection():
@@ -913,6 +951,7 @@ def cross(query, limit, project, branch, since, before, do_expand):
     from .cross_search import cross_search
 
     conn = _read_connection()
+    _warn_if_index_lagging()
 
     since_iso = _parse_date(since) if since else None
     before_iso = _parse_date(before) if before else None

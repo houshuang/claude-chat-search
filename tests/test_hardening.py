@@ -375,3 +375,134 @@ class DaemonResourceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DaemonNeverStarvesIndexingTests(DaemonDeferralTests):
+    """Under heavy load and swap, one embedding batch took hours and nothing
+    was indexed meanwhile (2 November 2026)."""
+
+    def add_unembedded(self, n):
+        db.insert_session(self.conn, {
+            "session_id": "pending", "native_session_id": "pending", "source": "claude",
+            "project_path": "/tmp/p", "message_count": 2,
+        })
+        db.insert_chunks(self.conn, [{
+            "session_id": "pending", "user_content": "q", "assistant_content": "a",
+            "combined_text": f"pending {i}", "turn_number": i,
+        } for i in range(n)])
+
+    def test_embedding_pass_stops_at_its_time_budget(self):
+        self.add_unembedded(5)
+        clock = [0.0]
+
+        def slow_embed(conn, rows):
+            db.insert_embeddings(conn, [r["id"] for r in rows],
+                                 [[0.1] * db.embedding_dim() for _ in rows])
+            clock[0] += 10
+            return len(rows), []
+
+        with patch.object(daemon, "EMBED_PASS_BATCH", 1), \
+             patch.object(daemon.time, "monotonic", lambda: clock[0]), \
+             patch.object(embedder, "embed_rows", slow_embed):
+            self.assertTrue(daemon.run_embeddings(self.conn, budget_seconds=15))
+            self.assertEqual(len(db.get_unembedded_chunks(self.conn, 10)), 3)
+            self.assertTrue(daemon.run_embeddings(self.conn, budget_seconds=15))
+            self.assertFalse(daemon.run_embeddings(self.conn, budget_seconds=100))
+        self.assertEqual(db.get_unembedded_chunks(self.conn, 10), [])
+
+    def test_queue_is_indexed_while_the_machine_is_busy(self):
+        heartbeat = self.root / "daemon.heartbeat"
+        self.queue()
+        real_process_deferred = daemon.process_deferred
+
+        def stop_after_first_pass(conn):
+            daemon._shutdown = True
+            return real_process_deferred(conn)
+
+        loop_conn = db.get_connection()
+        self.addCleanup(setattr, daemon, "_shutdown", False)
+        with patch.object(daemon, "QUEUE_PATH", self.root / ".queue"), \
+             patch.object(daemon, "QUEUE_PROCESSING", self.root / ".queue.processing"), \
+             patch.object(daemon, "HEARTBEAT_FILE", heartbeat), \
+             patch.object(daemon, "PID_FILE", self.root / "daemon.pid"), \
+             patch.object(daemon, "LOG_FILE", self.root / "daemon.log"), \
+             patch.object(daemon, "is_running", return_value=None), \
+             patch.object(daemon, "_get_git_commit", return_value=None), \
+             patch.object(daemon, "_start_search_server", return_value=None), \
+             patch.object(daemon, "get_connection", return_value=loop_conn), \
+             patch.object(daemon, "detect_git_remote", return_value=None), \
+             patch.object(daemon, "system_busy", return_value=True), \
+             patch.object(daemon, "process_deferred", stop_after_first_pass), \
+             patch.object(daemon, "full_scan") as full_scan, \
+             patch.object(daemon, "run_embeddings") as run_embeddings, \
+             patch.object(daemon.signal, "signal"):
+            daemon.run()
+        self.assertIsNotNone(db.get_session(self.conn, "sess-1"))
+        full_scan.assert_not_called()
+        run_embeddings.assert_not_called()
+        self.assertIn("queue_processed_at", json.loads(heartbeat.read_text()))
+
+    def test_watchdog_reports_a_stalled_loop(self):
+        watchdog = daemon.Watchdog(0.05, exit_on_stall=False)
+        with self.assertLogs("claude-chat-search-daemon", "ERROR") as logs:
+            watchdog.start()
+            time.sleep(0.3)
+            watchdog.stop()
+        self.assertIn("stalled", logs.output[0])
+
+
+class BoundedYieldTests(unittest.TestCase):
+    def test_background_batch_proceeds_when_a_query_never_finishes(self):
+        import numpy as np
+
+        class Model:
+            def encode(self, batch, **kwargs):
+                return np.zeros((len(batch), 2), dtype="float32")
+
+        embedder._queries_waiting += 1
+        try:
+            with patch.object(embedder, "MAX_YIELD_SECONDS", 0.05):
+                started = time.monotonic()
+                out = embedder._encode(Model(), ["d"] * 8, background=True)
+            self.assertEqual(out.shape, (8, 2))
+            self.assertLess(time.monotonic() - started, 2)
+        finally:
+            embedder._queries_waiting -= 1
+
+
+class IndexLagWarningTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.queue = root / ".queue"
+        self.heartbeat = root / "daemon.heartbeat"
+        for p in (patch.object(daemon, "QUEUE_PATH", self.queue),
+                  patch.object(daemon, "HEARTBEAT_FILE", self.heartbeat)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def beat(self, at):
+        self.heartbeat.write_text(json.dumps({"pid": 1, "queue_processed_at": at}))
+
+    def test_no_warning_without_waiting_conversations(self):
+        self.beat(0)
+        self.assertIsNone(cli_module.index_lag_warning(now=10_000))
+        self.queue.write_text("")
+        self.assertIsNone(cli_module.index_lag_warning(now=10_000))
+
+    def test_no_warning_while_the_queue_is_being_processed(self):
+        self.queue.write_text("/a.jsonl\n")
+        self.beat(10_000 - 60)
+        self.assertIsNone(cli_module.index_lag_warning(now=10_000))
+
+    def test_warns_when_the_queue_has_waited_too_long(self):
+        self.queue.write_text("/a.jsonl\n/a.jsonl\n/b.jsonl\n")
+        self.beat(10_000 - cli_module.INDEX_LAG_WARN_SECONDS - 1)
+        warning = cli_module.index_lag_warning(now=10_000)
+        self.assertIn("2 waiting", warning)
+        self.assertIn("grep -l", warning)
+
+    def test_warns_when_no_heartbeat_was_ever_written(self):
+        self.queue.write_text("/a.jsonl\n")
+        self.assertIn("recently", cli_module.index_lag_warning(now=10_000))

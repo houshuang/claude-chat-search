@@ -31,6 +31,7 @@ _model_lock = threading.RLock()
 _queries_waiting = 0
 _queries_waiting_lock = threading.Lock()
 ENCODE_BATCH = 8
+MAX_YIELD_SECONDS = 5.0
 
 
 @contextmanager
@@ -98,7 +99,9 @@ def _encode(model, texts: list[str], show_progress: bool = False, background: bo
     for start in range(0, len(order), ENCODE_BATCH):
         batch = [texts[i] for i in order[start:start + ENCODE_BATCH]]
         if background:
-            while _queries_waiting:
+            # Bounded, so a burst of searches delays a batch but cannot stall it.
+            yield_until = time.monotonic() + MAX_YIELD_SECONDS
+            while _queries_waiting and time.monotonic() < yield_until:
                 time.sleep(0.005)
         with _model_lock:
             vecs.append(model.encode(
