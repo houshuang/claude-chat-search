@@ -1,3 +1,5 @@
+import faulthandler
+import json
 import logging
 import os
 import signal
@@ -51,10 +53,24 @@ COOLDOWN_SECONDS = 600
 ACTIVE_COOLDOWN_SECONDS = 1800
 REINDEX_WINDOW = 3600
 EMBED_INTERVAL = 600
+# One embedding pass stops after EMBED_PASS_SECONDS and leaves the rest for the
+# next pass, EMBED_BACKLOG_INTERVAL later.  Under heavy swap one 256-row batch
+# took hours, and the queue went unindexed for all of that time.
+EMBED_PASS_SECONDS = 120
+EMBED_PASS_BATCH = 32
+EMBED_BACKLOG_INTERVAL = 60
 SCAN_INTERVAL = 3600  # hourly fingerprint scan catches transcripts no hook queued
-# While the 1-minute load average exceeds the core count, indexing and
-# embedding wait, but never for longer than MAX_BUSY_POSTPONE.
+# While the 1-minute load average exceeds the core count, embedding and the
+# full scan wait, but never for longer than MAX_BUSY_POSTPONE.  The queue is
+# indexed regardless: the cooldowns bound its cost, and an unindexed session
+# cannot be found even by an exact search.
 MAX_BUSY_POSTPONE = 3600
+# A main loop that has not come round for this long is stuck: the watchdog
+# writes every thread's stack to the log and, under launchd, exits for a
+# restart.  Monotonic time stops while the Mac sleeps, so sleep never trips it.
+WATCHDOG_SECONDS = 1800
+HEARTBEAT_FILE = DB_DIR / "daemon.heartbeat"
+HEARTBEAT_INTERVAL = 60
 WAL_CHECKPOINT_INTERVAL = 600  # 10 minutes
 CODE_CHECK_INTERVAL = 300  # 5 min — exit if source code changed (launchd restarts)
 # Past this footprint the daemon exits and launchd restarts it fresh: the
@@ -291,25 +307,34 @@ def full_scan(conn) -> int:
     return indexed
 
 
-def run_embeddings(conn):
-    """Run embedding pipeline in batches, checking shutdown between batches."""
+def run_embeddings(conn, budget_seconds: float = EMBED_PASS_SECONDS) -> bool:
+    """Embed pending chunks for at most budget_seconds.
+
+    Returns True when chunks are still pending, so the caller can come back
+    sooner than the regular interval.
+    """
     from .db import embedding_mismatch
     from .embedder import EmbeddingUnavailable, embed_rows, embedding_lock, release_gpu_cache
 
     mismatch = embedding_mismatch(conn)
     if mismatch:
         logger.warning("Embedding pass skipped: %s", mismatch)
-        return
+        return False
 
+    deadline = time.monotonic() + budget_seconds
+    more = False
     with embedding_lock() as acquired:
         if not acquired:
             logger.info("Embedding pass skipped: another indexer holds the lock")
-            return
+            return False
 
         embedded_any = False
         while not _shutdown:
-            rows = get_unembedded_chunks(conn, 256)
+            rows = get_unembedded_chunks(conn, EMBED_PASS_BATCH)
             if not rows:
+                break
+            if time.monotonic() >= deadline:
+                more = True
                 break
 
             embedded_any = True
@@ -326,6 +351,7 @@ def run_embeddings(conn):
                                len(skipped), skipped)
         if embedded_any:
             release_gpu_cache()
+    return more
 
 
 def system_busy() -> bool:
@@ -374,6 +400,60 @@ def wal_checkpoint(conn, mode: str = "PASSIVE", busy_ms: int = 1000):
         logger.exception("WAL checkpoint failed")
     finally:
         conn.setbusytimeout(BUSY_TIMEOUT_MS)
+
+
+def write_heartbeat() -> None:
+    """Record when the queue was last processed; search warns when it is old."""
+    try:
+        tmp = HEARTBEAT_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"pid": os.getpid(), "queue_processed_at": time.time()}))
+        tmp.replace(HEARTBEAT_FILE)
+    except OSError:
+        logger.exception("Could not write heartbeat")
+
+
+class Watchdog:
+    """Dump all stacks and exit when the main loop stops coming round."""
+
+    def __init__(self, timeout: float, exit_on_stall: bool):
+        self.timeout = timeout
+        self.exit_on_stall = exit_on_stall
+        self._last = time.monotonic()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="watchdog", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def kick(self) -> None:
+        self._last = time.monotonic()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def stalled_for(self) -> float:
+        return time.monotonic() - self._last
+
+    def _run(self) -> None:
+        while not self._stop.wait(min(60.0, self.timeout / 4)):
+            stalled = self.stalled_for()
+            if stalled < self.timeout:
+                continue
+            logger.error("Main loop stalled for %ds; thread stacks follow", stalled)
+            for handler in logging.getLogger().handlers:
+                stream = getattr(handler, "stream", None)
+                if stream is not None:
+                    try:
+                        stream.flush()
+                        faulthandler.dump_traceback(file=stream, all_threads=True)
+                        stream.flush()
+                    except (OSError, ValueError):
+                        pass
+            if self.exit_on_stall:
+                logger.error("Exiting so launchd restarts the daemon")
+                logging.shutdown()
+                os._exit(1)
+            self.kick()
 
 
 def is_running() -> int | None:
@@ -477,70 +557,57 @@ def run():
 
     server = _start_search_server()
 
-    # Restarts land here too, so the catch-up waits for load like the loop does.
-    busy_until = time.monotonic() + MAX_BUSY_POSTPONE
-    while not _shutdown and system_busy() and time.monotonic() < busy_until:
-        time.sleep(POLL_INTERVAL)
-
-    # Startup catch-up
-    if not _shutdown:
-        logger.info("Running startup full scan...")
-        while not _shutdown:
-            try:
-                count = full_scan(conn)
-                logger.info(f"Startup scan: indexed {count} sessions")
-                if count > 0:
-                    run_embeddings(conn)
-                break
-            except apsw.BusyError:
-                # Another explicit index/backup job can briefly hold the writer
-                # lock.  Wait at low CPU and retry instead of crash-looping under
-                # launchd KeepAlive.
-                logger.warning(
-                    "Startup scan deferred: database is busy; retrying in %ss",
-                    BUSY_RETRY_SECONDS,
-                )
-                for _ in range(BUSY_RETRY_SECONDS * 10):
-                    if _shutdown:
-                        break
-                    time.sleep(0.1)
-
-    last_embed_time = time.monotonic()
-    last_wal_checkpoint = time.monotonic()
-    last_code_check = time.monotonic()
-    last_scan = time.monotonic()
-    last_work = time.monotonic()
     # Set by the launchd plist, whose KeepAlive restarts a daemon that exits.
     supervised = os.environ.get("CLAUDE_CHAT_SEARCH_SUPERVISED") == "1"
+    watchdog = Watchdog(WATCHDOG_SECONDS, exit_on_stall=supervised)
+    watchdog.start()
+
+    # The startup catch-up is the first full scan; like later ones it waits for
+    # the load to drop, while the queue is indexed from the first iteration.
+    last_scan = float("-inf")
+    last_embed_time = time.monotonic()
+    embed_interval = EMBED_INTERVAL
+    last_wal_checkpoint = time.monotonic()
+    last_code_check = time.monotonic()
+    last_heavy_work = time.monotonic()
+    last_heartbeat = float("-inf")
 
     while not _shutdown:
-        # The queue file keeps collecting paths while work is postponed.
-        postpone = system_busy() and time.monotonic() - last_work < MAX_BUSY_POSTPONE
+        watchdog.kick()
+        try:
+            indexed = process_queue(conn) + process_deferred(conn)
+            if indexed > 0:
+                logger.info(f"Queue batch: indexed {indexed} sessions")
+            if time.monotonic() - last_heartbeat >= HEARTBEAT_INTERVAL:
+                write_heartbeat()
+                last_heartbeat = time.monotonic()
+        except Exception:
+            logger.exception("Error processing queue")
+
+        postpone = system_busy() and time.monotonic() - last_heavy_work < MAX_BUSY_POSTPONE
         if not postpone:
-            last_work = time.monotonic()
-            try:
-                indexed = process_queue(conn) + process_deferred(conn)
-                if indexed > 0:
-                    logger.info(f"Queue batch: indexed {indexed} sessions")
-            except Exception:
-                logger.exception("Error processing queue")
+            last_heavy_work = time.monotonic()
 
         if not postpone and time.monotonic() - last_scan >= SCAN_INTERVAL:
             try:
                 count = full_scan(conn)
                 if count:
                     logger.info(f"Periodic scan: indexed {count} sessions")
+            except apsw.BusyError:
+                logger.warning("Full scan deferred: database is busy")
             except Exception:
                 logger.exception("Error in periodic scan")
             last_scan = time.monotonic()
 
         # Run embeddings on a separate timer, independent of indexing
         now = time.monotonic()
-        if not postpone and now - last_embed_time >= EMBED_INTERVAL:
+        if not postpone and now - last_embed_time >= embed_interval:
+            more = False
             try:
-                run_embeddings(conn)
+                more = run_embeddings(conn)
             except Exception:
                 logger.exception("Error running embeddings")
+            embed_interval = EMBED_BACKLOG_INTERVAL if more else EMBED_INTERVAL
             last_embed_time = time.monotonic()
 
         # Periodic WAL checkpoint to prevent unbounded WAL growth
@@ -568,6 +635,7 @@ def run():
                 break
             time.sleep(0.1)
 
+    watchdog.stop()
     if server is not None:
         server.stop()
 

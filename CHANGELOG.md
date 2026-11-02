@@ -6,8 +6,17 @@
 
 - The daemon runs as a background process (`ProcessType Background`, `Nice 10`, low-priority I/O, two math threads). Reload its plist to apply this: `launchctl bootout gui/$(id -u)/com.claude-chat-search.daemon`, copy the plist to `~/Library/LaunchAgents/`, then `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.claude-chat-search.daemon.plist`.
 - A changing session is re-indexed at most every 10 minutes (30 once it keeps changing), new chunks are embedded every 10 minutes, and the search server refreshes its vectors every 5 minutes. New conversation turns take up to about 20 minutes to become searchable.
-- While the 1-minute load average exceeds the number of cores, indexing and embedding wait, for at most an hour.
+- While the 1-minute load average exceeds the number of cores, embedding and the hourly full scan wait, for at most an hour. Queued conversations are indexed regardless of load, so keyword and `--grep` search always find a session within its cooldown.
 - After each embedding pass the GPU allocator's cached memory is released, and under launchd (which sets `CLAUDE_CHAT_SEARCH_SUPERVISED=1`) the daemon restarts itself when its footprint passes 4 GB. The startup scan also waits for the load to drop.
+
+### Indexing never waits for embedding
+
+On 2 November 2026, with the load average above 20 and swap full, one embedding batch took two to four hours, and the daemon indexed nothing from 14:00 to 22:30. Sessions from that evening could not be found, even with `--grep`.
+
+- An embedding pass stops after two minutes and embeds 32 chunks at a time; a remaining backlog is picked up a minute later. The queue is indexed between passes.
+- Background embedding yields to a waiting search for at most five seconds per batch.
+- A watchdog thread writes every thread's stack to `daemon.log` when the main loop has not come round for 30 minutes, and under launchd exits so the daemon restarts.
+- The daemon records when it last processed the queue in `daemon.heartbeat`. `search` and `cross` print a warning when conversations have been waiting for more than 15 minutes, with a `grep` command for the transcripts.
 
 ## 0.2.0 — 2026-09-25
 
