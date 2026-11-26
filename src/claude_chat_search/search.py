@@ -173,7 +173,7 @@ def fused_session_results(
     if expand:
         fused = _expanded_search(
             conn, query, vec_results, fts_results, fetch_limit,
-            allowed_sessions, session_filter,
+            allowed_sessions, session_filter, semantic=query_embedding is not None,
         )
     else:
         fused = reciprocal_rank_fusion([vec_results, fts_results])
@@ -210,8 +210,12 @@ def hybrid_search(
     expand: bool = False,
     source: str | None = None,
     query_embedding: list[float] | None = None,
+    semantic: bool = True,
 ) -> list[dict]:
     """Run hybrid semantic + keyword search with RRF merging.
+
+    With semantic=False the embedding model is never loaded: only the keyword
+    ranking is used, including for expanded sub-queries.
 
     Deduplicates by session — returns the best-matching chunk per session.
 
@@ -224,7 +228,7 @@ def hybrid_search(
     candidate sessions before the list is cut to `limit`.
     """
     session_filter = _session_filter_sql(conn, project, branch, since, before, source)
-    if query_embedding is None and embedding_mismatch(conn) is None:
+    if semantic and query_embedding is None and embedding_mismatch(conn) is None:
         query_embedding = embed_query(query)
 
     pool = limit * RERANK_POOL if do_rerank else limit
@@ -255,7 +259,7 @@ def hybrid_search(
 
 
 def _expanded_search(conn, query, vec_results, fts_results, fetch_limit,
-                     allowed_sessions=None, session_filter=None):
+                     allowed_sessions=None, session_filter=None, semantic=True):
     """Run LLM query expansion and fuse all results with multi-list RRF."""
     expanded = expand_query(query)
 
@@ -268,7 +272,7 @@ def _expanded_search(conn, query, vec_results, fts_results, fetch_limit,
                 conn, eq.query, limit=fetch_limit, session_filter=session_filter
             ))
             labels.append(f"fts:{eq.query[:30]}")
-        elif eq.type in ("vec", "hyde") and embedding_mismatch(conn) is None:
+        elif semantic and eq.type in ("vec", "hyde") and embedding_mismatch(conn) is None:
             emb = embed_query(eq.query)
             ranked_lists.append(numpy_vector_search(
                 conn, emb, limit=fetch_limit, allowed_sessions=allowed_sessions

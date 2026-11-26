@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import time
 import unittest
@@ -14,6 +15,10 @@ from claude_chat_search.cli import _run_index, cli
 from claude_chat_search.codex_parser import iter_codex_jsonl_files
 
 from test_codex_parser import SESSION_ID, session_meta, write_jsonl
+
+# No test may start a real search server: it would load the model and serve
+# the developer's own index.
+os.environ["CLAUDE_CHAT_SEARCH_NO_SERVER"] = "1"
 
 
 class TempIndexCase(unittest.TestCase):
@@ -429,13 +434,13 @@ class DaemonNeverStarvesIndexingTests(DaemonDeferralTests):
             clock[0] += 10
             return len(rows), []
 
-        with patch.object(daemon, "EMBED_PASS_BATCH", 1), \
-             patch.object(daemon.time, "monotonic", lambda: clock[0]), \
+        with patch.object(embedder, "EMBED_PASS_BATCH", 1), \
+             patch.object(embedder.time, "monotonic", lambda: clock[0]), \
              patch.object(embedder, "embed_rows", slow_embed):
-            self.assertTrue(daemon.run_embeddings(self.conn, budget_seconds=15))
+            self.assertTrue(embedder.embed_pending(self.conn, 15))
             self.assertEqual(len(db.get_unembedded_chunks(self.conn, 10)), 3)
-            self.assertTrue(daemon.run_embeddings(self.conn, budget_seconds=15))
-            self.assertFalse(daemon.run_embeddings(self.conn, budget_seconds=100))
+            self.assertTrue(embedder.embed_pending(self.conn, 15))
+            self.assertFalse(embedder.embed_pending(self.conn, 100))
         self.assertEqual(db.get_unembedded_chunks(self.conn, 10), [])
 
     def test_queue_is_indexed_while_the_machine_is_busy(self):
@@ -456,18 +461,17 @@ class DaemonNeverStarvesIndexingTests(DaemonDeferralTests):
              patch.object(daemon, "LOG_FILE", self.root / "daemon.log"), \
              patch.object(daemon, "is_running", return_value=None), \
              patch.object(daemon, "_get_git_commit", return_value=None), \
-             patch.object(daemon, "_start_search_server", return_value=None), \
              patch.object(daemon, "get_connection", return_value=loop_conn), \
              patch.object(daemon, "detect_git_remote", return_value=None), \
              patch.object(daemon, "system_busy", return_value=True), \
              patch.object(daemon, "process_deferred", stop_after_first_pass), \
              patch.object(daemon, "full_scan") as full_scan, \
-             patch.object(daemon, "run_embeddings") as run_embeddings, \
+             patch.object(daemon, "start_embed_worker") as start_embed_worker, \
              patch.object(daemon.signal, "signal"):
             daemon.run()
         self.assertIsNotNone(db.get_session(self.conn, "sess-1"))
         full_scan.assert_not_called()
-        run_embeddings.assert_not_called()
+        start_embed_worker.assert_not_called()
         self.assertIn("queue_processed_at", json.loads(heartbeat.read_text()))
 
     def test_watchdog_reports_a_stalled_loop(self):

@@ -6,22 +6,22 @@ Semantic search over Claude Code and Codex conversations. Indexes JSONL conversa
 
 - `db.py` — SQLite schema, CRUD, vector/FTS search. Uses APSW + sqlite-vec extension.
 - `cli.py` — Click CLI: `init`, `index`, `search`, `daemon start/stop`, etc.
-- `daemon.py` — Background process that indexes queued conversations, defers work that arrives during a session's cooldown, and rescans fingerprints hourly. It indexes the queue on every loop regardless of load; embedding (in passes of at most `EMBED_PASS_SECONDS`) and the full scan wait while the load average exceeds the core count (at most an hour). A watchdog dumps all stacks and exits when the loop stalls for `WATCHDOG_SECONDS`; `daemon.heartbeat` records the last queue pass, and search warns when the queue has waited longer than `INDEX_LAG_WARN_SECONDS`, and exits for a launchd restart when its memory footprint passes `MAX_FOOTPRINT_BYTES` (only with `CLAUDE_CHAT_SEARCH_SUPERVISED=1`, set by the plist).
+- `daemon.py` — Background process that indexes queued conversations, defers work that arrives during a session's cooldown, and rescans fingerprints hourly. It indexes the queue on every loop regardless of load; the full scan and the embedding worker wait while the load average exceeds the core count (at most an hour). It never loads the embedding model: every `EMBED_INTERVAL` it starts `embed-pending` as a child process when chunks are pending. A watchdog dumps all stacks and exits when the loop stalls for `WATCHDOG_SECONDS`; `daemon.heartbeat` records the last queue pass, and search warns when the queue has waited longer than `INDEX_LAG_WARN_SECONDS`, and exits for a launchd restart when its memory footprint passes `MAX_FOOTPRINT_BYTES` (only with `CLAUDE_CHAT_SEARCH_SUPERVISED=1`, set by the plist).
 - `parser.py` — Parses Claude Code JSONL conversation files, extracts metadata.
 - `codex_parser.py` — Parses only visible conversation from Codex rollout files; excludes system/developer prompts, reasoning, tools, outputs, state, and subagent rollouts.
 - `sources.py` — Source-neutral discovery/parser dispatch.
 - `chunker.py` — Splits conversations into searchable chunks.
 - `models.py` — Embedding model specs (name, dim, max tokens, query/document prompts); `CLAUDE_CHAT_SEARCH_MODEL` overrides the default.
 - `embedder.py` — Embeds chunks and queries with the configured model.
-- `vector_search.py` — NumPy-cached vector search (faster than sqlite-vec for large result sets). The cache refreshes incrementally when `PRAGMA data_version` changes and filters by session before top-k.
-- `search_service.py` — Unix-socket search server run by the daemon (`search.sock` in the index directory, mode 0600) and the CLI client that falls back to in-process search.
+- `vector_search.py` — NumPy-cached vector search (faster than sqlite-vec for large result sets), held as float16 and scored in float32 blocks. The cache refreshes incrementally when `PRAGMA data_version` changes and filters by session before top-k.
+- `search_service.py` — Unix-socket search server (`search.sock` in the index directory, mode 0600), a process of its own: `ask()` in the CLI starts it on the first search, it embeds pending chunks while up, and it exits after `SERVER_IDLE_SECONDS` without a search. The CLI must never load the model: without a ready server it searches with `semantic=False`. Tests set `CLAUDE_CHAT_SEARCH_NO_SERVER=1` so none is started.
 - `summarizer.py` — LLM-based topic summarization of sessions.
 - `cross_search.py` — Cross-index search across multiple chat indexes.
 - `search.py` also supports `expand=True` for LLM query expansion (lex/vec/hyde variants via limbic's `expand_query` + `multi_list_rrf`).
 
 ## DB Schema (index.db in ~/.claude-chat-search/, or $CLAUDE_CHAT_SEARCH_HOME)
 
-Tables: `sessions`, `subagents`, `chunks`, `chunks_fts` (FTS5), `vec_chunks` (sqlite-vec), `meta` (key/value).
+Tables: `sessions`, `subagents`, `chunks`, `chunks_fts` (FTS5), `chunks_tri` (FTS5 trigram, behind `--grep`), `vec_chunks` (sqlite-vec), `meta` (key/value). Both FTS tables are external-content tables kept in step with `chunks` by triggers.
 
 `meta.embedding_model` / `embedding_dim` record the model behind `vec_chunks`. Never write vectors from another model into it: `db.embedding_mismatch()` is checked before every vector search and embedding pass, which fall back to FTS-only / skip on a mismatch. `migrate-embeddings` is the only way to change models; its progress is in `meta.migration_state` (`rechunk`, then `embed`), `migration_model` and `migration_cursor`.
 

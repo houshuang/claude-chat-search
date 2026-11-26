@@ -13,6 +13,8 @@ from .db import embedding_mismatch, get_unembedded_chunks, insert_embeddings, ma
 from .models import ModelSpec, configured_model
 
 BATCH_SIZE = 256
+# One background pass embeds this many chunks per database round trip.
+EMBED_PASS_BATCH = 32
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +149,51 @@ def process_embeddings(conn, callback=None) -> int:
         if not acquired:
             return 0
         return _process_embeddings_locked(conn, callback)
+
+
+def embed_pending(conn, budget_seconds: float, should_stop=lambda: False) -> bool:
+    """Embed pending chunks for at most budget_seconds.
+
+    Returns True when chunks are still pending.  Takes the embedding lock
+    before the model is touched, so a process that loses the race for the
+    lock never loads the model.
+    """
+    mismatch = embedding_mismatch(conn)
+    if mismatch:
+        logger.warning("Embedding pass skipped: %s", mismatch)
+        return False
+
+    deadline = time.monotonic() + budget_seconds
+    more = False
+    with embedding_lock() as acquired:
+        if not acquired:
+            logger.info("Embedding pass skipped: another process holds the lock")
+            return False
+
+        embedded_any = False
+        while not should_stop():
+            rows = get_unembedded_chunks(conn, EMBED_PASS_BATCH)
+            if not rows:
+                break
+            if time.monotonic() >= deadline:
+                more = True
+                break
+
+            embedded_any = True
+            try:
+                _stored, skipped = embed_rows(conn, rows)
+            except EmbeddingUnavailable:
+                logger.exception("Embedding model unavailable; retrying next pass")
+                break
+            except Exception:
+                logger.exception("Embedding batch failed")
+                break
+            if skipped:
+                logger.warning("Skipped %d chunk(s) that cannot be embedded: %s",
+                               len(skipped), skipped)
+        if embedded_any:
+            release_gpu_cache()
+    return more
 
 
 def embed_rows(conn, rows: list[dict]) -> tuple[int, list[int]]:

@@ -111,7 +111,8 @@ class VectorCacheTests(ModelCase):
             db.insert_embeddings(self.conn, ids, [fake_vector("alpha")])
             hits = vector_search.numpy_vector_search(self.conn, fake_vector("alpha"), limit=1)
         self.assertEqual(hits[0]["chunk_id"], ids[0])
-        self.assertAlmostEqual(hits[0]["distance"], 0.0, places=5)
+        # The cache holds 16-bit vectors: about three decimal places.
+        self.assertAlmostEqual(hits[0]["distance"], 0.0, places=3)
 
     def test_query_of_another_width_finds_nothing(self):
         self.add("s1", ["alpha"])

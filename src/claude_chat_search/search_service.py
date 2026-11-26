@@ -1,9 +1,13 @@
-"""Search served by the daemon over a unix socket.
+"""Search served by a model process over a unix socket.
 
-A one-shot CLI search spends most of its time loading the embedding model
-and reading every vector from SQLite.  The daemon keeps both in memory, so
-the CLI sends it the query and prints what comes back, falling back to an
-in-process search when no daemon answers.
+A one-shot CLI search would spend most of its time loading the embedding
+model and reading every vector from SQLite.  The search server keeps both in
+memory.  It is started by the first search that finds none running
+(`ask()`), embeds pending chunks while it is up, and exits after
+SERVER_IDLE_SECONDS without a search: a process that only unloads the model
+gives almost none of its memory back, one that exits gives back all of it.
+The CLI never loads the model itself; when the server is not ready in time
+it answers from the keyword index alone.
 
 Protocol: one JSON object per connection, newline-terminated, in each
 direction.  Request {"v": 1, "op": ..., "args": {...}}; reply
@@ -13,12 +17,17 @@ mode 0600 in the index directory.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
+import select
+import signal
 import socket
 import socketserver
 import stat
+import subprocess
+import sys
 import threading
 import time
 
@@ -26,7 +35,18 @@ from . import db
 
 PROTOCOL_VERSION = 1
 CONNECT_TIMEOUT = 0.25
+PING_TIMEOUT = 2.0
 MAX_REQUEST_BYTES = 1_000_000
+# How long a search waits for a server that is starting: imports, model and
+# vectors take about 10-15 s on an idle machine.
+START_TIMEOUT = 45.0
+SERVER_IDLE_SECONDS = 900
+SERVER_EMBED_INTERVAL = 600
+SERVER_EMBED_BACKLOG_INTERVAL = 60
+SERVER_EMBED_SECONDS = 120
+SERVER_LOG_MAX_BYTES = 1_000_000
+# Set to 1 to never start a search server: searches are keyword-only.
+NO_SERVER_ENV = "CLAUDE_CHAT_SEARCH_NO_SERVER"
 SEARCH_ARGS = ("project", "branch", "since", "before", "source")
 
 logger = logging.getLogger("claude-chat-search-daemon")
@@ -51,8 +71,9 @@ def request(op: str, args: dict, timeout: float) -> dict | None:
         sock.connect(str(path))
         sock.settimeout(timeout)
         payload = {"v": PROTOCOL_VERSION, "op": op, "args": args}
+        # The write side stays open: the server reads a closed connection as
+        # a caller that gave up, and drops the request.
         sock.sendall(json.dumps(payload).encode() + b"\n")
-        sock.shutdown(socket.SHUT_WR)
         data = bytearray()
         while chunk := sock.recv(65536):
             data += chunk
@@ -67,6 +88,55 @@ def request(op: str, args: dict, timeout: float) -> dict | None:
     if not isinstance(reply, dict) or not reply.get("ok"):
         return None
     return reply
+
+
+def server_log_path():
+    return db.DB_DIR / "search-server.log"
+
+
+def spawn_server() -> bool:
+    """Start a detached search server; False when that is disabled or fails."""
+    if os.environ.get(NO_SERVER_ENV) == "1":
+        return False
+    env = dict(os.environ)
+    env.setdefault("TOKENIZERS_PARALLELISM", "false")
+    for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+        env.setdefault(name, "2")
+    try:
+        db.DB_DIR.mkdir(parents=True, exist_ok=True)
+        with open(server_log_path(), "ab") as log:
+            subprocess.Popen(
+                [sys.executable, "-m", "claude_chat_search.cli", "serve"],
+                stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                start_new_session=True, env=env, cwd="/",
+            )
+    except OSError:
+        return False
+    return True
+
+
+def ask(op: str, args: dict, timeout: float,
+        start_timeout: float | None = None) -> dict | None:
+    """Send a request to the search server, starting it when none is running.
+
+    Waits up to start_timeout for a starting server to become ready.  None
+    means no answer in time; the caller falls back to keyword search.
+    """
+    start_timeout = START_TIMEOUT if start_timeout is None else start_timeout
+    deadline = time.monotonic() + start_timeout
+    pong = request("ping", {}, PING_TIMEOUT)
+    if pong is None and not spawn_server():
+        return None
+    while not (pong and pong.get("ready")):
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.25)
+        pong = request("ping", {}, PING_TIMEOUT)
+    return request(op, args, timeout)
+
+
+class Abandoned(Exception):
+    """The caller closed the connection before its request was run."""
 
 
 def _search_kwargs(args: dict) -> dict:
@@ -92,6 +162,14 @@ class SearchService:
         self._conn = None
         self._lock = threading.Lock()
         self.ready = threading.Event()
+        self.last_used = time.monotonic()
+        self._active = 0
+        self._active_lock = threading.Lock()
+
+    def idle_for(self) -> float:
+        """Seconds since the last request finished; 0 while one is running."""
+        with self._active_lock:
+            return 0.0 if self._active else time.monotonic() - self.last_used
 
     def _connection(self):
         if self._conn is None:
@@ -102,11 +180,24 @@ class SearchService:
         from .embedder import embed_query
         from .vector_search import MIN_REFRESH_INTERVAL, _cache
 
-        embed_query("warm up")
         # The cache is refreshed on its own connection and thread, so a search
-        # never waits for a refresh: it uses the copy that is current.
+        # never waits for a refresh: it uses the copy that is current.  The
+        # first read runs while the model loads.
         refresh_conn = db.get_read_connection()
-        _cache.refresh(refresh_conn)
+        failure = []
+
+        def read_vectors():
+            try:
+                _cache.refresh(refresh_conn)
+            except Exception as error:
+                failure.append(error)
+
+        reading = threading.Thread(target=read_vectors, name="vector-cache-load")
+        reading.start()
+        embed_query("warm up")
+        reading.join()
+        if failure:
+            raise failure[0]
         _cache.background_refresh = True
         self.ready.set()
 
@@ -120,7 +211,8 @@ class SearchService:
 
         threading.Thread(target=keep_fresh, name="vector-cache-refresh", daemon=True).start()
 
-    def handle(self, message: dict) -> dict:
+    def handle(self, message: dict, gone=lambda: False) -> dict:
+        """Answer one request; `gone` reports whether the caller hung up."""
         if message.get("v") != PROTOCOL_VERSION:
             raise ValueError("unsupported protocol version")
         op = message.get("op")
@@ -128,21 +220,26 @@ class SearchService:
         if op == "ping":
             return {"ok": True, "ready": self.ready.is_set()}
         if not self.ready.is_set():
-            # The model loads after the startup scan; answering "not ready" lets
-            # the CLI search in-process instead of waiting up to a minute.
             return {"ok": False, "error": "warming up"}
-        if op == "search":
-            kwargs = _search_kwargs(args)
-            kwargs["do_rerank"] = bool(args.get("rerank"))
-            return {"ok": True, "results": self._run(self._search, kwargs)}
-        if op == "cross_chat":
-            kwargs = _search_kwargs(args)
-            kwargs.pop("source")
-            results, embedding = self._run(self._cross_chat, kwargs)
-            return {"ok": True, "results": results, "embedding": embedding}
-        raise ValueError(f"unknown op: {op!r}")
+        with self._active_lock:
+            self._active += 1
+        try:
+            if op == "search":
+                kwargs = _search_kwargs(args)
+                kwargs["do_rerank"] = bool(args.get("rerank"))
+                return {"ok": True, "results": self._run(self._search, kwargs, gone)}
+            if op == "cross_chat":
+                kwargs = _search_kwargs(args)
+                kwargs.pop("source")
+                results, embedding = self._run(self._cross_chat, kwargs, gone)
+                return {"ok": True, "results": results, "embedding": embedding}
+            raise ValueError(f"unknown op: {op!r}")
+        finally:
+            with self._active_lock:
+                self._active -= 1
+                self.last_used = time.monotonic()
 
-    def _run(self, fn, kwargs):
+    def _run(self, fn, kwargs, gone=lambda: False):
         # Query expansion calls an LLM; give it its own connection so it does
         # not hold up other searches.
         if kwargs.get("expand"):
@@ -152,6 +249,10 @@ class SearchService:
             finally:
                 conn.close()
         with self._lock:
+            # Searches run one at a time; a caller that timed out while queued
+            # must not make the callers behind it wait for its search too.
+            if gone():
+                raise Abandoned()
             return fn(self._connection(), **kwargs)
 
     @staticmethod
@@ -174,10 +275,19 @@ class SearchService:
 
 
 class _Handler(socketserver.StreamRequestHandler):
+    def _gone(self) -> bool:
+        try:
+            readable, _, _ = select.select([self.connection], [], [], 0)
+            return bool(readable) and self.connection.recv(1, socket.MSG_PEEK) == b""
+        except OSError:
+            return True
+
     def handle(self):
         try:
             line = self.rfile.readline(MAX_REQUEST_BYTES)
-            reply = self.server.service.handle(json.loads(line))
+            reply = self.server.service.handle(json.loads(line), self._gone)
+        except Abandoned:
+            return
         except Exception as error:
             logger.exception("Search request failed")
             reply = {"ok": False, "error": str(error)}
@@ -199,7 +309,8 @@ class SearchServer:
         self._thread = None
 
     def start(self) -> None:
-        # Only the running daemon calls this, so a socket left here is stale.
+        # Only the process holding the server lock calls this, so a socket
+        # left here is stale.
         try:
             if stat.S_ISSOCK(self.path.lstat().st_mode):
                 self.path.unlink()
@@ -228,3 +339,90 @@ class SearchServer:
         except FileNotFoundError:
             pass
         self.service.close()
+
+
+def _server_lock():
+    """The open lock file when this process may be the search server, else None."""
+    db.DB_DIR.mkdir(parents=True, exist_ok=True)
+    handle = open(db.DB_DIR / ".search-server.lock", "a+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None
+    return handle
+
+
+def _embed_while_serving(stop: threading.Event) -> None:
+    from .embedder import embed_pending
+
+    conn = db.get_connection()
+    try:
+        wait = 5.0
+        while not stop.wait(wait):
+            more = False
+            try:
+                more = embed_pending(conn, SERVER_EMBED_SECONDS, stop.is_set)
+            except Exception:
+                logger.exception("Embedding pass failed")
+            wait = SERVER_EMBED_BACKLOG_INTERVAL if more else SERVER_EMBED_INTERVAL
+    finally:
+        conn.close()
+
+
+def serve(idle_seconds: float = SERVER_IDLE_SECONDS) -> int:
+    """Run the search server until it has been idle for idle_seconds."""
+    from .daemon import _get_git_commit
+
+    lock = _server_lock()
+    if lock is None:
+        return 0
+
+    log_path = server_log_path()
+    try:
+        if log_path.stat().st_size > SERVER_LOG_MAX_BYTES:
+            log_path.write_text("")
+    except OSError:
+        pass
+    logging.basicConfig(
+        filename=str(log_path), level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    stop = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    signal.signal(signal.SIGINT, lambda *_: stop.set())
+
+    started = time.monotonic()
+    commit = _get_git_commit()
+    server = SearchServer()
+    server.start()
+    logger.info("Search server starting (PID %d)", os.getpid())
+    try:
+        server.service.warm_up()
+        logger.info("Search server ready after %.1fs", time.monotonic() - started)
+        embedding = threading.Thread(
+            target=_embed_while_serving, args=(stop,), name="embed-pending", daemon=True
+        )
+        embedding.start()
+        checked = time.monotonic()
+        while not stop.wait(1.0):
+            if server.service.idle_for() >= idle_seconds:
+                logger.info("No search for %ds; exiting", idle_seconds)
+                break
+            # Serve the code that is on disk: exit once it changes and no
+            # search is running; the next search starts a new server.
+            if time.monotonic() - checked >= 60 and server.service.idle_for() > 0:
+                checked = time.monotonic()
+                if commit and _get_git_commit() not in (None, commit):
+                    logger.info("Code changed; exiting")
+                    break
+        stop.set()
+        embedding.join(timeout=30)
+    except Exception:
+        logger.exception("Search server failed")
+        return 1
+    finally:
+        server.stop()
+        lock.close()
+    return 0

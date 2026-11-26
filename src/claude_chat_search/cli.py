@@ -1,4 +1,5 @@
 import json
+import logging
 import hashlib
 import os
 import sys
@@ -202,29 +203,47 @@ def _parse_date(value: str) -> str:
     return value
 
 
-# The first search after a daemon (re)start waits for the model to load.
 DAEMON_TIMEOUT = 30
 DAEMON_TIMEOUT_SLOW = 120
+KEYWORD_ONLY_NOTE = (
+    "Note: semantic search is still loading, so these are keyword-only results. "
+    "Search again in a few seconds for the full ranking."
+)
+
+
+def _ask_search_server(conn, op: str, args: dict, slow: bool) -> dict | None:
+    """The search server's reply, or None when the search must be keyword-only.
+
+    The model is never loaded in this process: a one-off load takes most of
+    a minute and about 2 GB.
+    """
+    if embedding_mismatch(conn) is not None:
+        # The stored vectors cannot be searched; _warn_if_semantic_limited says so.
+        return None
+    from .search_service import ask
+
+    reply = ask(op, args, timeout=DAEMON_TIMEOUT_SLOW if slow else DAEMON_TIMEOUT)
+    if reply is None:
+        click.echo(KEYWORD_ONLY_NOTE, err=True)
+    return reply
 
 
 def _hybrid_search(conn, query: str, limit: int, rerank: bool = False,
                    expand: bool = False, **filters) -> tuple[list[dict], bool]:
-    """Hybrid search through the daemon, or in-process if it does not answer.
+    """Hybrid search through the search server, or keyword-only without it.
 
-    Returns (results, whether the daemon served them).
+    Returns (results, whether the server served them).
     """
-    from .search_service import request
-
-    reply = request("search", {
+    reply = _ask_search_server(conn, "search", {
         "query": query, "limit": limit, "rerank": rerank, "expand": expand,
         **filters,
-    }, timeout=DAEMON_TIMEOUT_SLOW if rerank or expand else DAEMON_TIMEOUT)
+    }, slow=rerank or expand)
     if reply is not None:
         return reply["results"], True
 
     from .search import hybrid_search
     return hybrid_search(conn, query, limit=limit, do_rerank=rerank,
-                         expand=expand, **filters), False
+                         expand=expand, semantic=False, **filters), False
 
 
 def _log_search(query: str, mode: str, results: list[dict], latency_ms: float,
@@ -255,6 +274,8 @@ def _log_search(query: str, mode: str, results: list[dict], latency_ms: float,
         entry["filters"] = filters
     if daemon:
         entry["daemon"] = True
+    elif mode == "hybrid":
+        entry["keyword_only"] = True
     try:
         with open(DB_PATH.parent / "search.log", "a") as f:
             f.write(json.dumps(entry) + "\n")
@@ -957,15 +978,14 @@ def cross(query, limit, project, branch, since, before, do_expand):
     before_iso = _parse_date(before) if before else None
 
     t0 = _time.monotonic()
-    from .search_service import request
-    reply = request("cross_chat", {
+    reply = _ask_search_server(conn, "cross_chat", {
         "query": query, "limit": limit, "project": project, "branch": branch,
         "since": since_iso, "before": before_iso, "expand": do_expand,
-    }, timeout=DAEMON_TIMEOUT_SLOW if do_expand else DAEMON_TIMEOUT)
+    }, slow=do_expand)
     chat = (reply["results"], reply["embedding"]) if reply else None
     results = cross_search(conn, query, limit=limit, project=project,
                            branch=branch, since=since_iso, before=before_iso,
-                           expand=do_expand, chat=chat)
+                           expand=do_expand, chat=chat, semantic=False)
     _warn_if_semantic_limited(conn)
     elapsed = (_time.monotonic() - t0) * 1000
 
@@ -1323,6 +1343,33 @@ def daemon_run():
     """Run daemon in the foreground (for launchd or direct use)."""
     from .daemon import run
     run()
+
+
+@cli.command("serve", hidden=True)
+def serve_command():
+    """Run the search server until it has been idle (started by `search`)."""
+    from .search_service import serve
+    raise SystemExit(serve())
+
+
+@cli.command("embed-pending", hidden=True)
+@click.option("--seconds", type=float, default=1200, show_default=True,
+              help="Stop after this long and leave the rest for the next run")
+def embed_pending_command(seconds):
+    """Embed pending chunks and exit (started by the daemon).
+
+    Exits with status 3 when chunks are left after the time limit.
+    """
+    from .embedder import embed_pending
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    conn = get_connection()
+    init_db(conn)
+    try:
+        more = embed_pending(conn, seconds)
+    finally:
+        conn.close()
+    raise SystemExit(3 if more else 0)
 
 
 @daemon.command("start")

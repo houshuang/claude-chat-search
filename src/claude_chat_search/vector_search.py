@@ -1,7 +1,8 @@
 """Brute-force vector search over an in-memory copy of vec_chunks.
 
-At ~100K chunks a numpy dot product takes a few milliseconds, faster than
-sqlite-vec for large result sets.  The copy is refreshed incrementally: when
+The copy is held as normalized float16, half the size of the stored float32
+vectors, and scored in blocks converted back to float32 (numpy has no fast
+float16 product).  It is refreshed incrementally: when
 the database has changed (PRAGMA data_version), only vectors for chunks that
 appeared are read, and rows for chunks that vanished are dropped.  When the
 recorded embedding model changes, the copy is rebuilt from scratch.
@@ -15,6 +16,9 @@ import numpy as np
 from .db import stored_embedding_model
 
 _READ_BATCH = 500
+# Rows converted at a time, when reading and when scoring: bounds the float32
+# scratch memory to a few tens of MB.
+_BLOCK = 8192
 
 
 # Each refresh after a re-index can re-read every chunk id; embeddings only
@@ -25,7 +29,7 @@ MIN_REFRESH_INTERVAL = 300.0
 def _empty_state():
     return (
         np.empty(0, dtype=np.int64),
-        np.empty((0, 0), dtype=np.float32),
+        np.empty((0, 0), dtype=np.float16),
         np.empty(0, dtype=np.int32),
     )
 
@@ -148,30 +152,51 @@ class VectorCache:
     def _read_vectors(conn, wanted: np.ndarray, full: bool):
         if len(wanted) == 0:
             return _empty_state()[:2]
+        # Filled block by block into one preallocated array: holding every row
+        # as bytes and normalizing a float32 copy took four times the memory.
+        ids = np.empty(len(wanted), dtype=np.int64)
+        matrix = None
+        filled = 0
+        block_ids: list[int] = []
+        block: list[bytes] = []
+
+        def flush():
+            nonlocal matrix, filled
+            if not block:
+                return
+            part = np.frombuffer(b"".join(block), dtype=np.float32).reshape(len(block), -1)
+            norms = np.linalg.norm(part, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            if matrix is None:
+                matrix = np.empty((len(wanted), part.shape[1]), dtype=np.float16)
+            matrix[filled:filled + len(block)] = part / norms
+            ids[filled:filled + len(block)] = block_ids
+            filled += len(block)
+            block.clear()
+            block_ids.clear()
+
+        def take(rows):
+            for chunk_id, embedding in rows:
+                block_ids.append(chunk_id)
+                block.append(embedding)
+                if len(block) >= _BLOCK:
+                    flush()
+
         if full:
             wanted_set = set(wanted.tolist())
-            rows = [
-                r for r in conn.execute("SELECT chunk_id, embedding FROM vec_chunks")
-                if r[0] in wanted_set
-            ]
+            take(r for r in conn.execute("SELECT chunk_id, embedding FROM vec_chunks")
+                 if r[0] in wanted_set)
         else:
-            rows = []
             values = wanted.tolist()
             for start in range(0, len(values), _READ_BATCH):
                 batch = values[start:start + _READ_BATCH]
                 placeholders = ",".join("?" * len(batch))
-                rows.extend(conn.execute(
+                take(conn.execute(
                     f"SELECT chunk_id, embedding FROM vec_chunks WHERE chunk_id IN ({placeholders})",
                     batch,
                 ))
-        if not rows:
-            return _empty_state()[:2]
-        ids = np.array([r[0] for r in rows], dtype=np.int64)
-        matrix = np.frombuffer(b"".join(r[1] for r in rows), dtype=np.float32)
-        matrix = matrix.reshape(len(rows), -1).copy()
-        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
-        norms[norms == 0] = 1.0
-        return ids, matrix / norms
+        flush()
+        return ids[:filled], matrix[:filled] if matrix is not None else _empty_state()[1]
 
     def search(
         self, query_embedding, limit: int = 20, allowed_sessions: set[str] | None = None,
@@ -185,10 +210,14 @@ class VectorCache:
         norm = np.linalg.norm(query)
         if norm > 0:
             query = query / norm
+        scores = np.empty(len(ids), dtype=np.float32)
         # Accelerate-backed float32 matmul raises spurious divide/overflow/invalid
         # RuntimeWarnings on macOS even for finite inputs.
         with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
-            scores = matrix @ query
+            for start in range(0, len(ids), _BLOCK):
+                scores[start:start + _BLOCK] = (
+                    matrix[start:start + _BLOCK].astype(np.float32) @ query
+                )
         candidates = np.arange(len(scores))
         if allowed_sessions is not None:
             codes = [self.session_codes[s] for s in allowed_sessions if s in self.session_codes]
