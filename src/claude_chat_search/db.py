@@ -33,7 +33,7 @@ DB_DIR = DB_PATH.parent
 
 # Bump when init_db() gains a migration; init_db() is a no-op once the
 # database's user_version has reached it.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def embedding_dim() -> int:
@@ -312,6 +312,12 @@ def _migrate(conn: apsw.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS chunks_session_idx ON chunks(session_id, embedded)"
     )
+    # Pending chunks are a handful among hundreds of thousands, and they sit at
+    # the end of the table: without this index every embedding batch reads the
+    # whole chunks table to find them.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS chunks_pending_idx ON chunks(id) WHERE embedded = 0"
+    )
 
     conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
     had_vectors = _table_exists(conn, "vec_chunks")
@@ -570,12 +576,14 @@ def mark_embedding_failed(conn: apsw.Connection, chunk_id: int) -> None:
     conn.execute("UPDATE chunks SET embedded = -1 WHERE id = ?", (chunk_id,))
 
 
+PENDING_CHUNKS_SQL = (
+    "SELECT id, combined_text FROM chunks "
+    "WHERE embedded = 0 ORDER BY id LIMIT ?"
+)
+
+
 def get_unembedded_chunks(conn: apsw.Connection, batch_size: int = 100) -> list[dict]:
-    return _fetchall(
-        conn,
-        "SELECT id, combined_text FROM chunks WHERE embedded = 0 LIMIT ?",
-        (batch_size,),
-    )
+    return _fetchall(conn, PENDING_CHUNKS_SQL, (batch_size,))
 
 
 def vector_search(conn: apsw.Connection, query_embedding: list[float], limit: int = 20) -> list[dict]:

@@ -29,7 +29,7 @@ Codex sessions use namespaced internal IDs (`codex:<native-id>`) and retain the 
 
 Schema changes go in `db._migrate()` together with a bump of `db.SCHEMA_VERSION`; `init_db()` returns immediately once `PRAGMA user_version` has reached it. Read-only commands use `get_read_connection()`.
 
-`chunks.embedded` is 0 (pending), 1 (embedded) or -1 (the model failed on this chunk; skipped until `reembed`).
+`chunks.embedded` is 0 (pending), 1 (embedded) or -1 (the model failed on this chunk; skipped until `reembed`). Look pending chunks up through `db.PENDING_CHUNKS_SQL`, which the partial index `chunks_pending_idx` serves; any other `embedded = 0` filter that selects columns outside an index reads the whole `chunks` table.
 
 ### FK Delete Order — CRITICAL
 

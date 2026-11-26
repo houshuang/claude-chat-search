@@ -257,6 +257,34 @@ class EmbeddingIsolationTests(TempIndexCase):
         self.assertEqual(len(db.get_unembedded_chunks(self.conn, 10)), 1)
 
 
+class PendingChunkIndexTests(TempIndexCase):
+    def plan(self):
+        rows = self.conn.execute(
+            "EXPLAIN QUERY PLAN " + db.PENDING_CHUNKS_SQL, (32,)
+        ).fetchall()
+        return " ".join(row[-1] for row in rows)
+
+    def test_pending_chunks_are_found_through_the_partial_index(self):
+        self.assertIn("chunks_pending_idx", self.plan())
+
+    def test_existing_index_gains_the_partial_index(self):
+        self.conn.execute("DROP INDEX chunks_pending_idx")
+        self.conn.execute("PRAGMA user_version = 3")
+        db.init_db(self.conn)
+        self.assertIn("chunks_pending_idx", self.plan())
+
+    def test_only_pending_chunks_are_returned_oldest_first(self):
+        self.add_session("s1", "/p", chunks=0)
+        ids = db.insert_chunks(self.conn, [{
+            "session_id": "s1", "user_content": "", "assistant_content": "",
+            "combined_text": f"text {i}", "turn_number": i,
+        } for i in range(4)])
+        self.conn.execute("UPDATE chunks SET embedded = 1 WHERE id = ?", (ids[0],))
+        self.conn.execute("UPDATE chunks SET embedded = -1 WHERE id = ?", (ids[2],))
+        rows = db.get_unembedded_chunks(self.conn, 10)
+        self.assertEqual([r["id"] for r in rows], [ids[1], ids[3]])
+
+
 class DaemonDeferralTests(TempIndexCase):
     def setUp(self):
         super().setUp()
