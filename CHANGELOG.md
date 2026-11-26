@@ -18,6 +18,28 @@ On 2 November 2026, with the load average above 20 and swap full, one embedding 
 - A watchdog thread writes every thread's stack to `daemon.log` when the main loop has not come round for 30 minutes, and under launchd exits so the daemon restarts.
 - The daemon records when it last processed the queue in `daemon.heartbeat`. `search` and `cross` print a warning when conversations have been waiting for more than 15 minutes, with a `grep` command for the transcripts.
 
+### The model runs only while it is used
+
+The daemon held the embedding model and every vector all day: 3.4 GB, 5.4 GB at its peak. Unloading the model in a running process gives back almost nothing (measured: 2.4 GB before, 2.3 GB after), so the model now lives in processes that exit.
+
+- The daemon only indexes. It stays near 50 MB and never imports PyTorch.
+- A search server holds the model and the vectors. The first search starts it and waits for it (27 s measured on a loaded machine; 0.7–1.0 s per search after that); it exits after 15 minutes without a search. It uses about 2.1 GB while it is up.
+- Pending chunks are embedded by the search server while it is up, and otherwise by a worker the daemon starts every 30 minutes. Semantic search can therefore lag new turns by up to 30 minutes (10 before); keyword and `--grep` search do not lag.
+- The CLI no longer loads the model when the server does not answer. That fallback took a median of 45 s and about 2 GB per search. It now answers from the keyword index, prints a note, and logs `"keyword_only": true`.
+- A search whose caller timed out while waiting in the server's queue is dropped; before, later searches waited for it.
+- The vectors are held once, as float16 (half the size), and are read in blocks; warm-up no longer makes four copies of them. Cosine scores are exact to about three decimals.
+- `daemon status` also reports the search server.
+
+Reload nothing: the daemon restarts itself when the code changes. A search server from before the update, if any, belongs to the old daemon and goes away with it.
+
+### `--grep` uses a trigram index
+
+`--grep` ran `LIKE '%text%'` over every chunk: a median of 4.9 s, up to 28 s.
+
+- Schema version 5 adds `chunks_tri`, an FTS5 trigram index over the chunk text. On the author's index it took 45 s to build, added 232 MB, and answers the same searches in about 0.1 s.
+- Queries shorter than three characters still read every chunk.
+- Like the version 4 step below, run an indexing command once after updating so the build does not happen in the throttled daemon.
+
 ### Pending chunks are found through an index
 
 Every embedding batch asked for chunks with `embedded = 0`, and no index answered that, so SQLite read the whole `chunks` table (924 MB on the author's index) to find a handful of rows at its end. With low-priority I/O and the machine swapping, one such read took more than 30 minutes: between 23 and 25 November 2026 the watchdog restarted the daemon six times in that query, and the queue went unindexed for half an hour each time.

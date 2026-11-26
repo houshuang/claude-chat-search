@@ -90,7 +90,7 @@ Options:
 - `-b` / `--branch` — filter by git branch name substring
 - `--since` — only results after date (`YYYY-MM-DD`, `3d`, `2w`, `1m`)
 - `--before` — only results before date
-- `--grep` — exact substring search (skips semantic/FTS5, just matches raw text)
+- `--grep` — exact substring search (skips semantic/FTS5, just matches raw text); answered from a trigram index, so it does not read every chunk (queries shorter than three characters still do)
 - `--file` — search by file path mentioned in session tool calls
 - `--rerank` — re-score the top 4 × `--limit` sessions with a cross-encoder, then keep `--limit` (slower, +5-15% accuracy)
 - `--expand` — LLM query expansion via Gemini Flash (needs `GEMINI_API_KEY`) for better recall on vague/cross-vocabulary queries (~3-5s extra, typically 3-5x score improvement). Generates keyword variants, semantic rephrases, and hypothetical document excerpts to bridge vocabulary gaps.
@@ -98,11 +98,13 @@ Options:
 
 Filters are applied while candidates are selected, in both the vector and the keyword ranking, so a narrow filter returns the best matches inside it rather than whatever survived a global top-k.
 
-When the daemon is running, `search`, `resume` and the chat half of `cross` are answered by it over a unix socket (`search.sock` in the index directory, mode 0600). It keeps the embedding model and all vectors in memory, so a search takes a fraction of a second instead of the 9–12 seconds a cold process needs to load them. Without a daemon the CLI searches in-process as before. Entries in `search.log` served by the daemon carry `"daemon": true`.
+`search`, `resume` and the chat half of `cross` are answered by a search server over a unix socket (`search.sock` in the index directory, mode 0600). The server holds the embedding model and all vectors in memory. The first search that finds no server starts one and waits for it; the server exits after 15 minutes without a search, which gives all of its memory back. Entries in `search.log` served by it carry `"daemon": true`.
 
-Right after the daemon starts it spends up to a minute on its startup scan and loading the model; until it is ready it answers "not ready" and the CLI searches in-process, so a search never hangs on a warming daemon. The daemon's copy of the vectors is refreshed at most every 30 seconds, so a chunk embedded in the last half minute may be missing from vector results (keyword search sees it at once).
+The CLI never loads the model itself. When the server is not ready within 45 seconds, or a search takes longer than 30 seconds, the CLI answers from the keyword index alone, says so on stderr, and logs `"keyword_only": true`; the server keeps loading, so the next search gets the full ranking. Set `CLAUDE_CHAT_SEARCH_NO_SERVER=1` to never start a server (all searches keyword-only).
 
-Measured on a 1.4 GB index (5.7k sessions, 114k chunks, granite-311m): median 0.2 s and p90 0.37 s per search through the daemon, against 9–12 s for a cold process.
+While it is up, the server embeds pending chunks every 10 minutes and refreshes its vectors at most every 5 minutes. A search whose caller has given up is dropped instead of making later searches wait for it.
+
+Measured on a 2.4 GB index (17k sessions, 239k chunks, granite-311m) on a Mac that was swapping: 27 s for the first search (server start), 0.7–1.0 s for later ones, 0.1 s for `--grep` (10–17 s before the trigram index). The server's footprint was 2.1 GB; the daemon alone stays near 50 MB.
 
 ### Embedding model
 
@@ -184,6 +186,8 @@ claude-chat-search subagent <session-id> <agent-id> --raw  # untruncated
 ## Continuous indexing with daemon
 
 Instead of spawning a subprocess on every tool call, a persistent daemon handles all indexing. A `PostToolUse` hook appends the transcript path to a queue file; the daemon picks it up every 2 seconds. A session re-indexed within its cooldown (60 seconds, five minutes for very active sessions) is deferred and indexed when the cooldown ends. An hourly scan compares transcript mtime and size fingerprints and picks up anything no hook queued.
+
+The daemon does not load the embedding model. Every 30 minutes, when chunks are pending and no search server is embedding them already, it starts a worker process (`embed-pending`) that embeds them and exits. Keyword and `--grep` search see a new chunk as soon as it is indexed; semantic search sees it after the next embedding pass.
 
 ### Start the daemon
 
@@ -286,11 +290,11 @@ Several processes write to one SQLite database: the daemon, the Codex job, and m
 - **chunker.py** — splits conversations into user/assistant turn pairs with token-aware splitting and paragraph-boundary overlap
 - **models.py** — the embedding models the index can be built with, their widths, token limits and query/document prompts
 - **embedder.py** — embeds chunks and queries locally with sentence-transformers (default `ibm-granite/granite-embedding-311m-multilingual-r2`)
-- **vector_search.py** — in-memory numpy vector search, refreshed incrementally when the database changes, with session filters applied before top-k
+- **vector_search.py** — in-memory numpy vector search over a float16 copy of the vectors, refreshed incrementally when the database changes, with session filters applied before top-k
 - **db.py** — SQLite with FTS5 for keyword search and `sqlite-vec` for vector storage
 - **search.py** — hybrid search (vector + keyword + grep + file) combined via Reciprocal Rank Fusion, deduplicated by session, with optional cross-encoder reranking and LLM query expansion (lex/vec/hyde variants) via limbic
-- **daemon.py** — persistent indexer daemon: queue-based incremental indexing with deferred retries, message-count skip, startup and hourly fingerprint scans; also serves searches
-- **search_service.py** — the daemon's unix-socket search server and the CLI's client for it
+- **daemon.py** — persistent indexer daemon: queue-based incremental indexing with deferred retries, message-count skip, startup and hourly fingerprint scans; starts the embedding worker
+- **search_service.py** — the on-demand unix-socket search server (model, vectors, embedding while it is up) and the CLI's client for it
 - **cli.py** — Click CLI exposing `init`, `index`, `search`, `resume`, `show`, `subagents`, `subagent`, `recover`, `reembed`, `migrate-embeddings`, `summarize`, `cross`, `backup`, `exclude`, `purge-excluded`, and `daemon` commands
 
 `cross` (chat history plus a separate research-file index) and `summarize` (topic summaries) depend on the author's own tooling at fixed local paths and will not work on other machines as-is.

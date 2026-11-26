@@ -100,6 +100,7 @@ def cross_search(
     before: str | None = None,
     expand: bool = False,
     chat: tuple[list[dict], list[float]] | None = None,
+    semantic: bool = True,
 ) -> list[dict]:
     """Search both chat and research indices, merge with RRF.
 
@@ -109,7 +110,9 @@ def cross_search(
     """
     fetch_limit = limit * 5
     if chat is None:
-        query_embedding = embed_query(query) if embedding_mismatch(conn) is None else None
+        query_embedding = (
+            embed_query(query) if semantic and embedding_mismatch(conn) is None else None
+        )
         candidates = chat_candidates(
             conn, query, query_embedding, limit, project, branch, since, before, expand
         )

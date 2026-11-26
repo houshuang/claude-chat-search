@@ -32,7 +32,10 @@ def blend(i: int, j: int, wi: float) -> list[float]:
 class FastSearchCase(TempIndexCase):
     def setUp(self):
         super().setUp()
-        vector_search.invalidate_cache()
+        # The cache is one per process and every test has its own database.
+        fresh = patch.object(vector_search, "_cache", vector_search.VectorCache())
+        fresh.start()
+        self.addCleanup(fresh.stop)
 
     def add(self, sid, project, texts_and_vectors, source="claude", last="2026-09-20T00:00:00+00:00"):
         db.insert_session(self.conn, {

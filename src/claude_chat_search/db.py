@@ -33,7 +33,7 @@ DB_DIR = DB_PATH.parent
 
 # Bump when init_db() gains a migration; init_db() is a no-op once the
 # database's user_version has reached it.
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def embedding_dim() -> int:
@@ -320,6 +320,8 @@ def _migrate(conn: apsw.Connection) -> None:
     )
 
     conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+    if not _table_exists(conn, GREP_INDEX_TABLE):
+        build_grep_index(conn)
     had_vectors = _table_exists(conn, "vec_chunks")
     if not had_vectors:
         _create_vec_table(conn, embedding_dim())
@@ -337,6 +339,48 @@ def _migrate(conn: apsw.Connection) -> None:
         "UPDATE chunks SET embedded = 0 WHERE embedded = 1 "
         "AND id NOT IN (SELECT chunk_id FROM vec_chunks)"
     )
+
+
+GREP_INDEX_TABLE = "chunks_tri"
+# Trigrams cannot answer a shorter pattern; those fall back to reading every chunk.
+GREP_INDEX_MIN_CHARS = 3
+
+
+def build_grep_index(conn: apsw.Connection) -> None:
+    """(Re)build the trigram index behind `search --grep`.
+
+    Call inside write_transaction().  The table, its triggers and its content
+    are created together, so the index is never partly filled.
+    """
+    for trigger in ("chunks_tri_ai", "chunks_tri_ad", "chunks_tri_au"):
+        conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+    conn.execute(f"DROP TABLE IF EXISTS {GREP_INDEX_TABLE}")
+    conn.execute(f"""
+        CREATE VIRTUAL TABLE {GREP_INDEX_TABLE} USING fts5(
+            combined_text,
+            content='chunks',
+            content_rowid='id',
+            tokenize='trigram',
+            detail='none'
+        )
+    """)
+    conn.execute(f"""CREATE TRIGGER chunks_tri_ai AFTER INSERT ON chunks BEGIN
+            INSERT INTO {GREP_INDEX_TABLE}(rowid, combined_text) VALUES (new.id, new.combined_text);
+        END""")
+    conn.execute(f"""CREATE TRIGGER chunks_tri_ad AFTER DELETE ON chunks BEGIN
+            INSERT INTO {GREP_INDEX_TABLE}({GREP_INDEX_TABLE}, rowid, combined_text)
+            VALUES('delete', old.id, old.combined_text);
+        END""")
+    conn.execute(f"""CREATE TRIGGER chunks_tri_au AFTER UPDATE OF combined_text ON chunks BEGIN
+            INSERT INTO {GREP_INDEX_TABLE}({GREP_INDEX_TABLE}, rowid, combined_text)
+            VALUES('delete', old.id, old.combined_text);
+            INSERT INTO {GREP_INDEX_TABLE}(rowid, combined_text) VALUES (new.id, new.combined_text);
+        END""")
+    conn.execute(f"INSERT INTO {GREP_INDEX_TABLE}({GREP_INDEX_TABLE}) VALUES('rebuild')")
+
+
+def has_grep_index(conn: apsw.Connection) -> bool:
+    return _table_exists(conn, GREP_INDEX_TABLE)
 
 
 def _table_exists(conn: apsw.Connection, name: str) -> bool:
@@ -649,24 +693,39 @@ def text_search(
     conn: apsw.Connection, query: str, limit: int = 50,
     source: str | None = None,
 ) -> list[dict]:
-    """Exact substring search via SQL LIKE. No FTS5, no embeddings."""
+    """Substring search, newest chunk first. No ranking, no embeddings.
+
+    Served by the trigram index when it exists and the query is long enough
+    for it; otherwise every chunk is read.
+    """
     if not query.strip():
         return []
     source_clause = " AND s.source = ?" if source else ""
-    bindings = (query, source, limit) if source else (query, limit)
-    return _fetchall(
-        conn,
-        f"""SELECT c.*, s.project_path, s.slug, s.git_branch,
+    pattern = f"%{query}%"
+    bindings = (pattern, source, limit) if source else (pattern, limit)
+    columns = """c.*, s.project_path, s.slug, s.git_branch,
                   s.message_count, s.first_message_at, s.last_message_at,
-                  s.source, s.native_session_id, s.thread_kind
+                  s.source, s.native_session_id, s.thread_kind"""
+    if len(query) >= GREP_INDEX_MIN_CHARS and has_grep_index(conn):
+        # CROSS JOIN keeps the trigram table outermost; left to itself the
+        # planner may drive from chunks and test each row against the index.
+        sql = f"""SELECT {columns}
+           FROM {GREP_INDEX_TABLE} t
+           CROSS JOIN chunks c ON c.id = t.rowid
+           JOIN sessions s ON c.session_id = s.session_id
+           WHERE t.combined_text LIKE ?
+           {source_clause}
+           ORDER BY t.rowid DESC
+           LIMIT ?"""
+    else:
+        sql = f"""SELECT {columns}
            FROM chunks c
            JOIN sessions s ON c.session_id = s.session_id
-           WHERE c.combined_text LIKE '%' || ? || '%'
+           WHERE c.combined_text LIKE ?
            {source_clause}
            ORDER BY c.id DESC
-           LIMIT ?""",
-        bindings,
-    )
+           LIMIT ?"""
+    return _fetchall(conn, sql, bindings)
 
 
 def file_search(

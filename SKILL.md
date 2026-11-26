@@ -19,6 +19,10 @@ Codex history every three hours. Running `index` first is redundant and can
 cold-start the embedding model. Run `search`/`cross` directly. Only index
 manually if a search clearly misses recent material (see "Re-index" below).
 
+The first search after a quiet period starts the search server and can take
+about half a minute; later ones take about a second. If stderr says the results
+are keyword-only, the server was still loading: run the same search again.
+
 **Identifier-first rule**: When the user mentions a PR number, branch name, URL,
 commit hash, session slug, error message, or any specific string — ALWAYS start
 with `--grep`. Semantic search is for vague topic recall only.
