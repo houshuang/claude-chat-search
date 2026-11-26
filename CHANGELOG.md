@@ -18,6 +18,13 @@ On 2 November 2026, with the load average above 20 and swap full, one embedding 
 - A watchdog thread writes every thread's stack to `daemon.log` when the main loop has not come round for 30 minutes, and under launchd exits so the daemon restarts.
 - The daemon records when it last processed the queue in `daemon.heartbeat`. `search` and `cross` print a warning when conversations have been waiting for more than 15 minutes, with a `grep` command for the transcripts.
 
+### Pending chunks are found through an index
+
+Every embedding batch asked for chunks with `embedded = 0`, and no index answered that, so SQLite read the whole `chunks` table (924 MB on the author's index) to find a handful of rows at its end. With low-priority I/O and the machine swapping, one such read took more than 30 minutes: between 23 and 25 November 2026 the watchdog restarted the daemon six times in that query, and the queue went unindexed for half an hour each time.
+
+- Schema version 4 adds the partial index `chunks_pending_idx` (`chunks(id) WHERE embedded = 0`). The lookup takes milliseconds and the index holds only the pending rows.
+- The migration reads the `chunks` table once while it holds the write lock. Run any indexing command (for example `claude-chat-search index --source codex`) once after updating so it happens at normal I/O priority and not in the throttled daemon.
+
 ## 0.2.0 — 2026-09-25
 
 ### Upgrading from 0.1
